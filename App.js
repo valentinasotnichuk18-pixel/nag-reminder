@@ -22,6 +22,12 @@ db.execSync(`
   );
 `);
 
+// Міграція: додаємо колонку deadline, якщо її ще немає
+const taskColumns = db.getAllSync('PRAGMA table_info(tasks)');
+if (!taskColumns.some((c) => c.name === 'deadline')) {
+  db.execSync('ALTER TABLE tasks ADD COLUMN deadline TEXT');
+}
+
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
     shouldShowBanner: true,
@@ -40,6 +46,12 @@ const INTERVALS = [
   { min: 60, label: '1 год' },
   { min: 120, label: '2 год' },
   { min: 180, label: '3 год' },
+];
+
+const DEADLINE_DAYS = [
+  { key: 'none', label: 'Без дедлайну' },
+  { key: 'today', label: 'Сьогодні' },
+  { key: 'tomorrow', label: 'Завтра' },
 ];
 
 // ---------- База ----------
@@ -67,13 +79,47 @@ function loadSettings() {
 
 function loadTasks() {
   return db.getAllSync(
-    "SELECT id, title FROM tasks WHERE status = 'active' ORDER BY id DESC"
+    "SELECT id, title, deadline FROM tasks WHERE status = 'active' ORDER BY id DESC"
   );
 }
 
 function intervalLabel(min) {
   const found = INTERVALS.find((i) => i.min === min);
   return found ? found.label : `${min} хв`;
+}
+
+// ---------- Дедлайн ----------
+
+function buildDeadline(dayKey, hour) {
+  if (dayKey === 'none') return null;
+  const d = new Date();
+  if (dayKey === 'tomorrow') d.setDate(d.getDate() + 1);
+  d.setHours(hour, 0, 0, 0);
+  return d;
+}
+
+function pad(n) {
+  return String(n).padStart(2, '0');
+}
+
+function deadlineInfo(iso) {
+  if (!iso) return null;
+  const d = new Date(iso);
+  const now = new Date();
+  const time = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+
+  if (d < now) return { text: 'прострочено', overdue: true };
+
+  const tomorrow = new Date(now);
+  tomorrow.setDate(now.getDate() + 1);
+
+  if (d.toDateString() === now.toDateString()) {
+    return { text: `до ${time}`, overdue: false };
+  }
+  if (d.toDateString() === tomorrow.toDateString()) {
+    return { text: `завтра до ${time}`, overdue: false };
+  }
+  return { text: `${pad(d.getDate())}.${pad(d.getMonth() + 1)} до ${time}`, overdue: false };
 }
 
 // ---------- Сповіщення ----------
@@ -99,7 +145,6 @@ async function setupNotifications() {
   }
 }
 
-// Час нагадувань для завдання: від часу створення кожні N хвилин у межах годин
 function slotsFor(createdAtIso, s) {
   const created = new Date(createdAtIso);
   const base = created.getHours() * 60 + created.getMinutes();
@@ -112,18 +157,26 @@ function slotsFor(createdAtIso, s) {
   return slots;
 }
 
+function notificationBody(task) {
+  const info = deadlineInfo(task.deadline);
+  if (!info) return task.title;
+  return info.overdue
+    ? `${task.title} · дедлайн прострочено!`
+    : `${task.title} · ${info.text}`;
+}
+
 async function doReschedule() {
   await Notifications.cancelAllScheduledNotificationsAsync();
   const s = loadSettings();
   const active = db.getAllSync(
-    "SELECT id, title, created_at FROM tasks WHERE status = 'active'"
+    "SELECT id, title, created_at, deadline FROM tasks WHERE status = 'active'"
   );
   for (const t of active) {
     for (const slot of slotsFor(t.created_at, s)) {
       await Notifications.scheduleNotificationAsync({
         content: {
           title: 'Нагадування',
-          body: t.title,
+          body: notificationBody(t),
           data: { taskId: t.id },
           categoryIdentifier: CATEGORY_ID,
         },
@@ -138,7 +191,6 @@ async function doReschedule() {
   }
 }
 
-// Черга, щоб перепланування не накладались одне на одне
 let rescheduleChain = Promise.resolve();
 function rescheduleAll() {
   rescheduleChain = rescheduleChain.then(doReschedule).catch(console.warn);
@@ -166,7 +218,7 @@ async function completeTask(taskId) {
 
 async function sendTestNotification() {
   const t = db.getFirstSync(
-    "SELECT id, title FROM tasks WHERE status = 'active' ORDER BY id DESC"
+    "SELECT id, title, deadline FROM tasks WHERE status = 'active' ORDER BY id DESC"
   );
   if (!t) {
     Alert.alert('Немає завдань', 'Спочатку додай хоча б одне завдання.');
@@ -175,7 +227,7 @@ async function sendTestNotification() {
   await Notifications.scheduleNotificationAsync({
     content: {
       title: 'Нагадування (тест)',
-      body: t.title,
+      body: notificationBody(t),
       data: { taskId: t.id },
       categoryIdentifier: CATEGORY_ID,
     },
@@ -263,6 +315,8 @@ function SettingsScreen({ onBack }) {
 export default function App() {
   const [screen, setScreen] = useState('tasks');
   const [text, setText] = useState('');
+  const [deadlineDay, setDeadlineDay] = useState('none');
+  const [deadlineHour, setDeadlineHour] = useState(18);
   const [tasks, setTasks] = useState(loadTasks);
   const [settings, setSettings] = useState(loadSettings);
 
@@ -298,13 +352,22 @@ export default function App() {
   const addTask = () => {
     const title = text.trim();
     if (!title) return;
+
+    const deadline = buildDeadline(deadlineDay, deadlineHour);
+    if (deadline && deadline < new Date()) {
+      Alert.alert('Цей час уже минув', 'Обери пізнішу годину або "Завтра".');
+      return;
+    }
+
     db.runSync(
-      'INSERT INTO tasks (title, created_at) VALUES (?, ?)',
+      'INSERT INTO tasks (title, created_at, deadline) VALUES (?, ?, ?)',
       title,
-      new Date().toISOString()
+      new Date().toISOString(),
+      deadline ? deadline.toISOString() : null
     );
     setTasks(loadTasks());
     setText('');
+    setDeadlineDay('none');
     Keyboard.dismiss();
     rescheduleAll();
   };
@@ -337,18 +400,47 @@ export default function App() {
         </Pressable>
       </View>
 
+      <View style={styles.chips}>
+        {DEADLINE_DAYS.map((d) => (
+          <Pressable
+            key={d.key}
+            style={[styles.chip, deadlineDay === d.key && styles.chipActive]}
+            onPress={() => setDeadlineDay(d.key)}
+          >
+            <Text style={[styles.chipText, deadlineDay === d.key && styles.chipTextActive]}>
+              {d.label}
+            </Text>
+          </Pressable>
+        ))}
+      </View>
+
+      {deadlineDay !== 'none' && (
+        <HourStepper label="До" value={deadlineHour} onChange={setDeadlineHour} />
+      )}
+
       <FlatList
+        style={{ marginTop: 8 }}
         data={tasks}
         keyExtractor={(item) => String(item.id)}
         ListEmptyComponent={<Text style={styles.empty}>Завдань немає</Text>}
-        renderItem={({ item }) => (
-          <View style={styles.task}>
-            <Text style={styles.taskText}>{item.title}</Text>
-            <Pressable style={styles.doneButton} onPress={() => doneTask(item.id)}>
-              <Text style={styles.doneText}>Готово</Text>
-            </Pressable>
-          </View>
-        )}
+        renderItem={({ item }) => {
+          const info = deadlineInfo(item.deadline);
+          return (
+            <View style={styles.task}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.taskText}>{item.title}</Text>
+                {info && (
+                  <Text style={[styles.deadline, info.overdue && styles.deadlineOverdue]}>
+                    {info.text}
+                  </Text>
+                )}
+              </View>
+              <Pressable style={styles.doneButton} onPress={() => doneTask(item.id)}>
+                <Text style={styles.doneText}>Готово</Text>
+              </Pressable>
+            </View>
+          );
+        }}
       />
       <StatusBar style="dark" />
     </View>
@@ -359,13 +451,15 @@ const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#fff', paddingTop: 60, paddingHorizontal: 16 },
   header: { fontSize: 26, fontWeight: 'bold', marginBottom: 8 },
   settingsLink: { color: '#2563eb', marginBottom: 16 },
-  row: { flexDirection: 'row', marginBottom: 16 },
+  row: { flexDirection: 'row', marginBottom: 12 },
   input: { flex: 1, borderWidth: 1, borderColor: '#ccc', borderRadius: 8, padding: 12, fontSize: 16 },
   addButton: { backgroundColor: '#2563eb', borderRadius: 8, paddingHorizontal: 16, justifyContent: 'center', marginLeft: 8 },
   addText: { color: '#fff', fontWeight: 'bold' },
   task: { flexDirection: 'row', alignItems: 'center', padding: 12, borderWidth: 1, borderColor: '#eee', borderRadius: 8, marginBottom: 8 },
-  taskText: { flex: 1, fontSize: 16 },
-  doneButton: { backgroundColor: '#16a34a', borderRadius: 6, paddingVertical: 6, paddingHorizontal: 12 },
+  taskText: { fontSize: 16 },
+  deadline: { fontSize: 13, color: '#b45309', marginTop: 4 },
+  deadlineOverdue: { color: '#b42318', fontWeight: 'bold' },
+  doneButton: { backgroundColor: '#16a34a', borderRadius: 6, paddingVertical: 6, paddingHorizontal: 12, marginLeft: 8 },
   doneText: { color: '#fff' },
   empty: { color: '#888', textAlign: 'center', marginTop: 40 },
   section: { fontSize: 16, fontWeight: 'bold', marginTop: 16, marginBottom: 8 },
