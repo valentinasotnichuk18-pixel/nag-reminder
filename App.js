@@ -8,6 +8,43 @@ import * as SQLite from 'expo-sqlite';
 import * as Notifications from 'expo-notifications';
 import * as Calendar from 'expo-calendar/legacy';
 import { DateTimePickerAndroid } from '@react-native-community/datetimepicker';
+import Svg, { Path, Circle } from 'react-native-svg';
+import {
+  useFonts, Nunito_500Medium, Nunito_700Bold, Nunito_800ExtraBold, Nunito_900Black,
+} from '@expo-google-fonts/nunito';
+
+const APP_NAME = 'Тук-тук';
+
+// ---------- Кольори і шрифти ----------
+
+const C = {
+  green: '#1F7A4D',
+  greenDark: '#145A38',
+  mint: '#D9F2E3',
+  mintLight: '#EEF5EF',
+  cream: '#F4F1E8',
+  creamField: '#FBFAF5',
+  line: '#E3E0D5',
+  white: '#FFFFFF',
+  ink: '#1E2A22',
+  text: '#3E4A42',
+  muted: '#5E6B62',
+  honey: '#F4B860',
+  honeyLight: '#FCE9C8',
+  honeyText: '#7A4A06',
+  red: '#B42318',
+  blue: '#3A5BA9',
+  blueLight: '#E7ECF7',
+};
+
+const F = {
+  regular: 'Nunito_500Medium',
+  bold: 'Nunito_700Bold',
+  extra: 'Nunito_800ExtraBold',
+  black: 'Nunito_900Black',
+};
+
+// ---------- База ----------
 
 const db = SQLite.openDatabaseSync('tasks.db');
 
@@ -76,7 +113,7 @@ const DEADLINE_DAYS = [
   { key: 'none', label: 'Без дедлайну' },
   { key: 'today', label: 'Сьогодні' },
   { key: 'tomorrow', label: 'Завтра' },
-  { key: 'pick', label: 'Обрати дату' },
+  { key: 'pick', label: 'Дата…' },
 ];
 
 const EVENT_DAYS = DEADLINE_DAYS.filter((d) => d.key !== 'none');
@@ -93,9 +130,12 @@ const KINDS = [
   { key: 'event', label: 'Подія' },
 ];
 
+const WEEKDAYS = ['неділя', 'понеділок', 'вівторок', 'середа', 'четвер', "п'ятниця", 'субота'];
+const MONTHS = ['січня', 'лютого', 'березня', 'квітня', 'травня', 'червня', 'липня', 'серпня', 'вересня', 'жовтня', 'листопада', 'грудня'];
+
 function nagTitle(order) {
-  if (order <= 1) return 'Нагадую';
-  if (order <= 3) return 'Знову нагадую';
+  if (order <= 1) return 'Тук-тук!';
+  if (order <= 3) return 'Знову тук-тук';
   if (order <= 6) return 'Я не відстану';
   return 'Ну досить відкладати!';
 }
@@ -112,6 +152,11 @@ function formatTime(d) {
 
 function formatDate(d) {
   return `${pad(d.getDate())}.${pad(d.getMonth() + 1)}`;
+}
+
+function todayLabel() {
+  const d = new Date();
+  return `${WEEKDAYS[d.getDay()]}, ${d.getDate()} ${MONTHS[d.getMonth()]}`;
 }
 
 function minutesLabel(total) {
@@ -187,7 +232,7 @@ function openPicker({ value, mode, minimumDate, onPick }) {
   });
 }
 
-// ---------- База ----------
+// ---------- Налаштування ----------
 
 function getSetting(key, defaultValue) {
   const row = db.getFirstSync('SELECT value FROM settings WHERE key = ?', key);
@@ -231,7 +276,7 @@ function loadSettings() {
 
 function loadTasks() {
   return db.getAllSync(
-    "SELECT id, title, deadline FROM tasks WHERE status = 'active' ORDER BY id DESC"
+    "SELECT id, title, deadline, created_at FROM tasks WHERE status = 'active' ORDER BY id DESC"
   );
 }
 
@@ -262,7 +307,6 @@ async function getMainCalendar() {
   );
 }
 
-// Події головного календаря за період. null: немає дозволу
 async function loadEvents(from, to, ask = false) {
   try {
     if (!(await hasCalendarPermission(ask))) return null;
@@ -273,7 +317,6 @@ async function loadEvents(from, to, ask = false) {
       .map((e) => {
         const start = new Date(e.startDate);
         return {
-          // Повторювані події мають однаковий id, тому додаємо час початку
           key: `${e.id}-${start.getTime()}`,
           title: e.title || '(без назви)',
           start,
@@ -287,7 +330,6 @@ async function loadEvents(from, to, ask = false) {
   }
 }
 
-// Події від цього моменту до кінця дня (як у зведенні в n8n)
 function loadTodayEvents(ask = false) {
   const now = new Date();
   return loadEvents(now, endOfDay(now), ask);
@@ -347,6 +389,19 @@ function remindersWord(n) {
   return n % 10 === 1 && n % 100 !== 11 ? 'нагадування' : 'нагадувань';
 }
 
+function timesWord(n) {
+  const last = n % 10;
+  const lastTwo = n % 100;
+  if (last === 1 && lastTwo !== 11) return 'раз';
+  if (last >= 2 && last <= 4 && (lastTwo < 12 || lastTwo > 14)) return 'рази';
+  return 'разів';
+}
+
+function nagBadge(task, s) {
+  const n = countReminders(task.created_at, new Date().toISOString(), s);
+  return n === 0 ? 'ще не тукала' : `тукала ${n} ${timesWord(n)}`;
+}
+
 function doneSummary(task) {
   const duration = formatDuration(new Date(task.done_at) - new Date(task.created_at));
   const count = countReminders(task.created_at, task.done_at, loadSettings());
@@ -367,11 +422,11 @@ function summarySlots(s) {
 }
 
 function summaryLabel(s) {
-  if (!s.summaryEnabled) return 'вимкнено';
+  if (!s.summaryEnabled) return 'зведення вимкнено';
   if (s.summaryMode === 'times') {
-    return `о ${summarySlots(s).map(minutesLabel).join(', ')}`;
+    return `зведення о ${summarySlots(s).map(minutesLabel).join(', ')}`;
   }
-  return `кожні ${s.summaryIntervalMin / 60} год`;
+  return `зведення кожні ${s.summaryIntervalMin / 60} год`;
 }
 
 function tasksWord(n) {
@@ -388,7 +443,6 @@ function loadSummaryTasks() {
   );
 }
 
-// dayEvents: події того дня, на який заплановане зведення
 function summaryContent(list, dayEvents) {
   const lines = list.slice(0, MAX_SUMMARY_LINES).map((t, i) => {
     if (!t.deadline) return `${i + 1}. ${t.title}`;
@@ -411,7 +465,6 @@ function summaryContent(list, dayEvents) {
   };
 }
 
-// Події, які ще актуальні на момент зведення: того ж дня і ще не почались
 function eventsForSummaryAt(time, events) {
   return events.filter(
     (e) => isSameDay(e.start, time) && (e.allDay || e.start >= time)
@@ -424,6 +477,7 @@ async function setupNotifications() {
   await Notifications.setNotificationChannelAsync(CHANNEL_ID, {
     name: 'Нагадування',
     importance: Notifications.AndroidImportance.HIGH,
+    lightColor: C.green,
   });
   await Notifications.setNotificationCategoryAsync(CATEGORY_ID, [
     {
@@ -465,7 +519,6 @@ async function doReschedule() {
     "SELECT id, title, created_at, deadline FROM tasks WHERE status = 'active'"
   );
 
-  // Нав'язливі нагадування про завдання: щодня, завжди
   for (const t of active) {
     for (const slot of slotsFor(t.created_at, s)) {
       await Notifications.scheduleNotificationAsync({
@@ -474,6 +527,7 @@ async function doReschedule() {
           body: notificationBody(t),
           data: { taskId: t.id },
           categoryIdentifier: CATEGORY_ID,
+          color: C.green,
         },
         trigger: {
           type: Notifications.SchedulableTriggerInputTypes.DAILY,
@@ -485,7 +539,6 @@ async function doReschedule() {
     }
   }
 
-  // Зведення: окремо на кожен день, з подіями саме цього дня
   const slots = summarySlots(s);
   if (slots.length === 0) return;
 
@@ -505,7 +558,7 @@ async function doReschedule() {
       if (taskList.length === 0 && dayEvents.length === 0) continue;
 
       await Notifications.scheduleNotificationAsync({
-        content: summaryContent(taskList, dayEvents),
+        content: { ...summaryContent(taskList, dayEvents), color: C.green },
         trigger: {
           type: Notifications.SchedulableTriggerInputTypes.DATE,
           date: time,
@@ -550,10 +603,11 @@ async function snoozeTask(taskId) {
   await Notifications.scheduleNotificationAsync({
     identifier: `${SNOOZE_PREFIX}${taskId}`,
     content: {
-      title: 'Відпочила? Повертаюсь',
+      title: 'Відпочила? Тук-тук, я тут',
       body: notificationBody(t),
       data: { taskId: t.id },
       categoryIdentifier: CATEGORY_ID,
+      color: C.green,
     },
     trigger: {
       type: Notifications.SchedulableTriggerInputTypes.TIME_INTERVAL,
@@ -609,6 +663,7 @@ async function sendTestNotification() {
       body: notificationBody(t),
       data: { taskId: t.id },
       categoryIdentifier: CATEGORY_ID,
+      color: C.green,
     },
     trigger: {
       type: Notifications.SchedulableTriggerInputTypes.TIME_INTERVAL,
@@ -628,7 +683,7 @@ async function sendTestSummary() {
   }
   const content = summaryContent(list, events);
   await Notifications.scheduleNotificationAsync({
-    content: { ...content, title: `${content.title} (тест)` },
+    content: { ...content, title: `${content.title} (тест)`, color: C.green },
     trigger: {
       type: Notifications.SchedulableTriggerInputTypes.TIME_INTERVAL,
       seconds: 10,
@@ -638,45 +693,123 @@ async function sendTestSummary() {
   Alert.alert('Тест', 'Згорни застосунок, зведення прийде через 10 секунд.');
 }
 
-// ---------- Компоненти ----------
+// ---------- Іконки ----------
 
-function TimeField({ label, value, onChange }) {
-  const open = () => {
-    const d = new Date();
-    d.setHours(Math.floor(value / 60), value % 60, 0, 0);
-    openPicker({
-      value: d,
-      mode: 'time',
-      onPick: (date) => onChange(date.getHours() * 60 + date.getMinutes()),
-    });
-  };
-
+function BellIcon({ size = 24, color = C.cream }) {
   return (
-    <Pressable style={[styles.timeButton, { flex: 1 }]} onPress={open}>
-      <Text style={styles.timeLabel}>{label}</Text>
-      <Text style={styles.timeValue}>{minutesLabel(value)}</Text>
-      <Text style={styles.timeChange}>Змінити</Text>
+    <Svg width={size} height={size} viewBox="0 0 64 64">
+      <Path d="M20 28a12 12 0 0 1 24 0c0 13 5 17 5 17H15s5-4 5-17" fill={color} stroke={color} strokeWidth={3} strokeLinejoin="round" />
+      <Path d="M27.5 51a5 5 0 0 0 9 0" fill="none" stroke={color} strokeWidth={4} strokeLinecap="round" />
+    </Svg>
+  );
+}
+
+function CheckIcon({ size = 22, color = C.green }) {
+  return (
+    <Svg width={size} height={size} viewBox="0 0 24 24">
+      <Path d="m5 12.5 4.5 4.5L19 7.5" fill="none" stroke={color} strokeWidth={3} strokeLinecap="round" strokeLinejoin="round" />
+    </Svg>
+  );
+}
+
+function PlusIcon({ size = 24, color = C.white }) {
+  return (
+    <Svg width={size} height={size} viewBox="0 0 24 24">
+      <Path d="M12 5v14M5 12h14" fill="none" stroke={color} strokeWidth={2.8} strokeLinecap="round" />
+    </Svg>
+  );
+}
+
+function SlidersIcon({ size = 22, color = C.ink }) {
+  return (
+    <Svg width={size} height={size} viewBox="0 0 24 24">
+      <Path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12" fill="none" stroke={color} strokeWidth={2} strokeLinecap="round" />
+      <Circle cx={16} cy={6} r={2} fill="none" stroke={color} strokeWidth={2} />
+      <Circle cx={10} cy={12} r={2} fill="none" stroke={color} strokeWidth={2} />
+      <Circle cx={18} cy={18} r={2} fill="none" stroke={color} strokeWidth={2} />
+    </Svg>
+  );
+}
+
+function BackIcon({ size = 22, color = C.ink }) {
+  return (
+    <Svg width={size} height={size} viewBox="0 0 24 24">
+      <Path d="m15 18-6-6 6-6" fill="none" stroke={color} strokeWidth={2.4} strokeLinecap="round" strokeLinejoin="round" />
+    </Svg>
+  );
+}
+
+// ---------- Спільні компоненти ----------
+
+// variant "solid": вибране зелене; "soft": вибране м'ятне
+function Chips({ items, value, onChange, variant = 'solid' }) {
+  return (
+    <View style={styles.chips}>
+      {items.map((i) => {
+        const active = value === i.key;
+        return (
+          <Pressable
+            key={i.key}
+            style={[
+              styles.chip,
+              active && (variant === 'soft' ? styles.chipSoftActive : styles.chipSolidActive),
+            ]}
+            onPress={() => onChange(i.key)}
+          >
+            <Text
+              style={[
+                styles.chipText,
+                active && (variant === 'soft' ? styles.chipSoftText : styles.chipSolidText),
+              ]}
+            >
+              {i.label}
+            </Text>
+          </Pressable>
+        );
+      })}
+    </View>
+  );
+}
+
+function Segmented({ items, value, onChange }) {
+  return (
+    <View style={styles.segmented}>
+      {items.map((i) => {
+        const active = value === i.key;
+        return (
+          <Pressable
+            key={i.key}
+            style={[styles.segment, active && styles.segmentActive]}
+            onPress={() => onChange(i.key)}
+          >
+            <Text style={[styles.segmentText, active && styles.segmentTextActive]}>{i.label}</Text>
+          </Pressable>
+        );
+      })}
+    </View>
+  );
+}
+
+function TimeTile({ label, value, onPress }) {
+  return (
+    <Pressable style={styles.timeTile} onPress={onPress}>
+      <Text style={styles.timeTileLabel}>{label}</Text>
+      <Text style={styles.timeTileValue}>{value}</Text>
     </Pressable>
   );
 }
 
-function Chips({ items, value, onChange }) {
-  return (
-    <View style={styles.chips}>
-      {items.map((i) => (
-        <Pressable
-          key={i.key}
-          style={[styles.chip, value === i.key && styles.chipActive]}
-          onPress={() => onChange(i.key)}
-        >
-          <Text style={[styles.chipText, value === i.key && styles.chipTextActive]}>
-            {i.label}
-          </Text>
-        </Pressable>
-      ))}
-    </View>
-  );
+function pickMinutes(value, onChange) {
+  const d = new Date();
+  d.setHours(Math.floor(value / 60), value % 60, 0, 0);
+  openPicker({
+    value: d,
+    mode: 'time',
+    onPick: (date) => onChange(date.getHours() * 60 + date.getMinutes()),
+  });
 }
+
+// ---------- Налаштування ----------
 
 function SettingsScreen({ onBack }) {
   const initial = loadSettings();
@@ -723,87 +856,102 @@ function SettingsScreen({ onBack }) {
 
   return (
     <ScrollView style={styles.screen} contentContainerStyle={styles.scrollContent}>
-      <Text style={styles.header}>Налаштування</Text>
-
-      <Text style={styles.section}>Нагадувати кожні</Text>
-      <Chips
-        items={INTERVALS.map((i) => ({ key: i.min, label: i.label }))}
-        value={intervalMin}
-        onChange={setIntervalMin}
-      />
-
-      <Text style={styles.section}>Години нагадувань</Text>
-      <TimeField label="З" value={startMin} onChange={setStartMin} />
-      <TimeField label="До" value={endMin} onChange={setEndMin} />
-
-      <View style={styles.switchRow}>
-        <Text style={[styles.section, { flex: 1, marginTop: 0, marginBottom: 0 }]}>
-          Зведення всіх справ
-        </Text>
-        <Switch value={summaryEnabled} onValueChange={setSummaryEnabled} />
+      <View style={styles.titleRow}>
+        <Pressable style={styles.iconButton} onPress={() => onBack(false)} accessibilityLabel="Назад">
+          <BackIcon />
+        </Pressable>
+        <Text style={styles.screenTitle}>Налаштування</Text>
       </View>
 
-      {summaryEnabled && (
-        <View>
-          <Chips
-            items={[
-              { key: 'interval', label: 'Кожні N годин' },
-              { key: 'times', label: 'У конкретний час' },
-            ]}
-            value={summaryMode}
-            onChange={setSummaryMode}
-          />
-
-          {summaryMode === 'interval' && (
-            <View>
-              <Text style={styles.hint}>
-                Від {minutesLabel(startMin)} до {minutesLabel(endMin)}, кожні:
-              </Text>
-              <Chips
-                items={SUMMARY_INTERVALS.map((i) => ({ key: i.min, label: i.label }))}
-                value={summaryIntervalMin}
-                onChange={setSummaryIntervalMin}
-              />
-            </View>
-          )}
-
-          {summaryMode === 'times' && (
-            <View>
-              {summaryTimes.map((t, i) => (
-                <View key={i} style={styles.timeRow}>
-                  <TimeField label={`${i + 1}.`} value={t} onChange={(v) => updateTime(i, v)} />
-                  <Pressable
-                    style={styles.removeButton}
-                    onPress={() => removeTime(i)}
-                    accessibilityLabel="Прибрати час"
-                  >
-                    <Text style={styles.removeText}>✕</Text>
-                  </Pressable>
-                </View>
-              ))}
-              {summaryTimes.length < MAX_SUMMARY_TIMES && (
-                <Pressable style={styles.addTimeButton} onPress={addTime}>
-                  <Text style={styles.timeChange}>+ Додати час</Text>
-                </Pressable>
-              )}
-            </View>
-          )}
+      <View style={styles.card}>
+        <Text style={styles.cardTitle}>Тукати кожні</Text>
+        <Chips
+          items={INTERVALS.map((i) => ({ key: i.min, label: i.label }))}
+          value={intervalMin}
+          onChange={setIntervalMin}
+        />
+        <View style={styles.tileRow}>
+          <TimeTile label="Не раніше" value={minutesLabel(startMin)} onPress={() => pickMinutes(startMin, setStartMin)} />
+          <TimeTile label="Не пізніше" value={minutesLabel(endMin)} onPress={() => pickMinutes(endMin, setEndMin)} />
         </View>
-      )}
+      </View>
 
-      <Pressable style={styles.saveButton} onPress={save}>
-        <Text style={styles.addText}>Зберегти</Text>
+      <View style={styles.card}>
+        <View style={styles.switchRow}>
+          <Text style={[styles.cardTitle, { flex: 1, marginBottom: 0 }]}>Зведення всіх справ</Text>
+          <Switch
+            value={summaryEnabled}
+            onValueChange={setSummaryEnabled}
+            trackColor={{ false: '#D5D2C7', true: '#8FCDAA' }}
+            thumbColor={summaryEnabled ? C.green : C.white}
+          />
+        </View>
+
+        {summaryEnabled && (
+          <View style={{ marginTop: 12 }}>
+            <Segmented
+              items={[
+                { key: 'interval', label: 'Кожні N год' },
+                { key: 'times', label: 'У певний час' },
+              ]}
+              value={summaryMode}
+              onChange={setSummaryMode}
+            />
+
+            {summaryMode === 'interval' && (
+              <View style={{ marginTop: 12 }}>
+                <Text style={styles.hint}>
+                  Від {minutesLabel(startMin)} до {minutesLabel(endMin)}, кожні:
+                </Text>
+                <Chips
+                  items={SUMMARY_INTERVALS.map((i) => ({ key: i.min, label: i.label }))}
+                  value={summaryIntervalMin}
+                  onChange={setSummaryIntervalMin}
+                />
+              </View>
+            )}
+
+            {summaryMode === 'times' && (
+              <View style={{ marginTop: 12 }}>
+                {summaryTimes.map((t, i) => (
+                  <View key={i} style={styles.summaryTimeRow}>
+                    <TimeTile label={`Зведення ${i + 1}`} value={minutesLabel(t)} onPress={() => pickMinutes(t, (v) => updateTime(i, v))} />
+                    <Pressable
+                      style={styles.removeButton}
+                      onPress={() => removeTime(i)}
+                      accessibilityLabel="Прибрати час"
+                    >
+                      <Text style={styles.removeText}>✕</Text>
+                    </Pressable>
+                  </View>
+                ))}
+                {summaryTimes.length < MAX_SUMMARY_TIMES && (
+                  <Pressable style={styles.dashedButton} onPress={addTime}>
+                    <Text style={styles.linkText}>+ Додати час</Text>
+                  </Pressable>
+                )}
+              </View>
+            )}
+          </View>
+        )}
+      </View>
+
+      <Pressable style={styles.primaryButton} onPress={save}>
+        <Text style={styles.primaryButtonText}>Зберегти</Text>
       </Pressable>
-      <Pressable style={styles.backButton} onPress={() => onBack(false)}>
-        <Text style={styles.backText}>Назад без збереження</Text>
+      <Pressable style={styles.ghostButton} onPress={() => onBack(false)}>
+        <Text style={styles.ghostButtonText}>Назад без збереження</Text>
       </Pressable>
 
-      <Pressable style={styles.testButton} onPress={sendTestNotification}>
-        <Text style={styles.testText}>Тест: нагадування через 10 секунд</Text>
-      </Pressable>
-      <Pressable style={styles.testButton} onPress={sendTestSummary}>
-        <Text style={styles.testText}>Тест: зведення через 10 секунд</Text>
-      </Pressable>
+      <View style={[styles.card, { marginTop: 16 }]}>
+        <Text style={styles.cardTitle}>Для тестування</Text>
+        <Pressable style={styles.testButton} onPress={sendTestNotification}>
+          <Text style={styles.testText}>Нагадування через 10 секунд</Text>
+        </Pressable>
+        <Pressable style={styles.testButton} onPress={sendTestSummary}>
+          <Text style={styles.testText}>Зведення через 10 секунд</Text>
+        </Pressable>
+      </View>
       <StatusBar style="dark" />
     </ScrollView>
   );
@@ -812,6 +960,10 @@ function SettingsScreen({ onBack }) {
 // ---------- Головний екран ----------
 
 export default function App() {
+  const [fontsLoaded] = useFonts({
+    Nunito_500Medium, Nunito_700Bold, Nunito_800ExtraBold, Nunito_900Black,
+  });
+
   const [screen, setScreen] = useState('tasks');
   const [kind, setKind] = useState('task');
   const [text, setText] = useState('');
@@ -848,7 +1000,7 @@ export default function App() {
         setTasks(loadTasks());
       } else if (response.actionIdentifier === 'snooze') {
         const t = await snoozeTask(taskId);
-        if (t) setInfoMsg(`«${t.title}» нагадаю через ${SNOOZE_MIN} хв`);
+        if (t) setInfoMsg(`«${t.title}»: тукну через ${SNOOZE_MIN} хв`);
       }
     };
 
@@ -882,6 +1034,10 @@ export default function App() {
     const timer = setTimeout(() => setInfoMsg(null), 4000);
     return () => clearTimeout(timer);
   }, [infoMsg]);
+
+  if (!fontsLoaded) {
+    return <View style={{ flex: 1, backgroundColor: C.cream }} />;
+  }
 
   if (screen === 'settings') {
     return (
@@ -1107,142 +1263,170 @@ export default function App() {
   // ----- Екран -----
 
   const isEvent = kind === 'event';
+  const eventMode = modeForDate(eventStart);
 
-  const eventsBlock = (
+  const header = (
     <View>
-      <Text style={styles.section}>Сьогодні в календарі</Text>
+      {Array.isArray(events) && events.length > 0 && (
+        <View style={{ marginBottom: 6 }}>
+          <Text style={styles.sectionTitle}>Сьогодні в календарі</Text>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8, paddingBottom: 4 }}>
+            {events.map((e) => (
+              <View key={e.key} style={styles.eventCard}>
+                <Text style={styles.eventTime}>{eventTime(e)}</Text>
+                <Text style={styles.eventTitle} numberOfLines={2}>{e.title}</Text>
+              </View>
+            ))}
+          </ScrollView>
+        </View>
+      )}
       {events === null && (
-        <Pressable style={styles.permissionButton} onPress={() => refreshEvents(true)}>
-          <Text style={styles.timeChange}>Показати події з календаря</Text>
+        <Pressable style={styles.dashedButton} onPress={() => refreshEvents(true)}>
+          <Text style={styles.linkText}>Показати події з календаря</Text>
         </Pressable>
       )}
-      {Array.isArray(events) && events.length === 0 && (
-        <Text style={styles.hint}>На сьогодні подій більше немає</Text>
-      )}
-      {Array.isArray(events) &&
-        events.map((e) => (
-          <View key={e.key} style={styles.eventRow}>
-            <View style={styles.eventBadge}>
-              <Text style={styles.eventBadgeText}>{eventTime(e)}</Text>
-            </View>
-            <Text style={[styles.taskText, { flex: 1 }]}>{e.title}</Text>
-          </View>
-        ))}
-      <Text style={styles.section}>Завдання</Text>
+      <Text style={styles.sectionTitle}>
+        Тукаю, поки не зробиш{tasks.length ? ` · ${tasks.length}` : ''}
+      </Text>
     </View>
   );
 
   return (
     <View style={styles.container}>
-      <Text style={styles.header}>Мої завдання</Text>
-
-      <Pressable onPress={() => setScreen('settings')}>
-        <Text style={styles.settingsLink}>
-          Нагадування: кожні {intervalLabel(settings.intervalMin)}, з {minutesLabel(settings.startMin)} до {minutesLabel(settings.endMin)}.
-          {'\n'}Зведення: {summaryLabel(settings)}. Змінити
-        </Text>
-      </Pressable>
-
-      {editing ? (
-        <Text style={styles.editTitle}>Редагування завдання</Text>
-      ) : (
-        <Chips items={KINDS} value={kind} onChange={setKind} />
-      )}
-
-      <View style={styles.row}>
-        <TextInput
-          style={styles.input}
-          placeholder={isEvent ? 'Назва події' : 'Що треба зробити?'}
-          value={text}
-          onChangeText={setText}
-          onSubmitEditing={isEvent ? saveEvent : saveTask}
-        />
-        <Pressable
-          style={[styles.addButton, isEvent && styles.eventButton]}
-          onPress={isEvent ? saveEvent : saveTask}
-        >
-          <Text style={styles.addText}>{editing ? 'Зберегти' : 'Додати'}</Text>
+      <View style={styles.headerRow}>
+        <View style={styles.brand}>
+          <View style={styles.logo}>
+            <BellIcon size={24} />
+          </View>
+          <View>
+            <Text style={styles.appName}>{APP_NAME}</Text>
+            <Text style={styles.today}>{todayLabel()}</Text>
+          </View>
+        </View>
+        <Pressable style={styles.iconButton} onPress={() => setScreen('settings')} accessibilityLabel="Налаштування">
+          <SlidersIcon />
         </Pressable>
       </View>
 
-      {!isEvent && (
-        <View>
-          <Chips
-            items={DEADLINE_DAYS.map((d) => ({
-              key: d.key,
-              label: d.key === 'pick' && deadlineMode === 'pick' && deadline ? formatDate(deadline) : d.label,
-            }))}
-            value={deadlineMode}
-            onChange={chooseDay}
-          />
-          {deadline && (
-            <Pressable style={styles.timeButton} onPress={pickTime}>
-              <Text style={styles.timeLabel}>Дедлайн о</Text>
-              <Text style={styles.timeValue}>{formatTime(deadline)}</Text>
-              <Text style={styles.timeChange}>Змінити час</Text>
-            </Pressable>
-          )}
-        </View>
-      )}
+      <Pressable onPress={() => setScreen('settings')}>
+        <Text style={styles.settingsLine}>
+          Тукаю кожні {intervalLabel(settings.intervalMin)}, {minutesLabel(settings.startMin)}–{minutesLabel(settings.endMin)} · {summaryLabel(settings)}
+        </Text>
+      </Pressable>
 
-      {isEvent && (
-        <View>
-          <Chips
-            items={EVENT_DAYS.map((d) => ({
-              key: d.key,
-              label: d.key === 'pick' && modeForDate(eventStart) === 'pick' ? formatDate(eventStart) : d.label,
-            }))}
-            value={modeForDate(eventStart)}
-            onChange={chooseEventDay}
+      <View style={styles.formCard}>
+        {editing ? (
+          <Text style={styles.editTitle}>Редагування завдання</Text>
+        ) : (
+          <Segmented items={KINDS} value={kind} onChange={setKind} />
+        )}
+
+        <View style={styles.inputRow}>
+          <TextInput
+            style={styles.input}
+            placeholder={isEvent ? 'Назва події' : 'Що треба зробити?'}
+            placeholderTextColor={C.muted}
+            value={text}
+            onChangeText={setText}
+            onSubmitEditing={isEvent ? saveEvent : saveTask}
           />
-          <View style={styles.row}>
-            <Pressable style={[styles.timeButton, styles.halfTime]} onPress={() => pickEventTime('start')}>
-              <Text style={styles.timeLabel}>Початок</Text>
-              <Text style={styles.timeValue}>{formatTime(eventStart)}</Text>
+          <Pressable
+            style={[styles.addButton, isEvent && { backgroundColor: C.blue }]}
+            onPress={isEvent ? saveEvent : saveTask}
+            accessibilityLabel={editing ? 'Зберегти' : 'Додати'}
+          >
+            {editing ? <CheckIcon color={C.white} /> : <PlusIcon />}
+          </Pressable>
+        </View>
+
+        {!isEvent && (
+          <View>
+            <Chips
+              variant="soft"
+              items={DEADLINE_DAYS.map((d) => ({
+                key: d.key,
+                label:
+                  d.key === deadlineMode && deadline
+                    ? `${d.key === 'pick' ? formatDate(deadline) : d.label} · ${formatTime(deadline)}`
+                    : d.label,
+              }))}
+              value={deadlineMode}
+              onChange={(key) => (key === deadlineMode && deadline && key !== 'pick' ? pickTime() : chooseDay(key))}
+            />
+            {deadline && (
+              <Pressable onPress={pickTime}>
+                <Text style={styles.linkSmall}>Змінити час дедлайну</Text>
+              </Pressable>
+            )}
+          </View>
+        )}
+
+        {isEvent && (
+          <View>
+            <Chips
+              variant="soft"
+              items={EVENT_DAYS.map((d) => ({
+                key: d.key,
+                label: d.key === 'pick' && eventMode === 'pick' ? formatDate(eventStart) : d.label,
+              }))}
+              value={eventMode}
+              onChange={chooseEventDay}
+            />
+            <View style={styles.tileRow}>
+              <TimeTile label="Початок" value={formatTime(eventStart)} onPress={() => pickEventTime('start')} />
+              <TimeTile label="Кінець" value={formatTime(eventEnd)} onPress={() => pickEventTime('end')} />
+            </View>
+            <Text style={styles.hint}>Нагадати:</Text>
+            <Chips variant="soft" items={EVENT_REMINDERS} value={eventReminder} onChange={setEventReminder} />
+          </View>
+        )}
+
+        {editing && (
+          <View style={styles.editActions}>
+            <Pressable style={styles.deleteButton} onPress={confirmDelete}>
+              <Text style={styles.deleteText}>Видалити</Text>
             </Pressable>
-            <Pressable style={[styles.timeButton, styles.halfTime, { marginRight: 0 }]} onPress={() => pickEventTime('end')}>
-              <Text style={styles.timeLabel}>Кінець</Text>
-              <Text style={styles.timeValue}>{formatTime(eventEnd)}</Text>
+            <Pressable style={styles.cancelButton} onPress={resetForm}>
+              <Text style={styles.cancelText}>Скасувати</Text>
             </Pressable>
           </View>
-          <Text style={styles.hint}>Нагадати:</Text>
-          <Chips items={EVENT_REMINDERS} value={eventReminder} onChange={setEventReminder} />
-        </View>
-      )}
-
-      {editing && (
-        <View style={styles.editActions}>
-          <Pressable style={styles.deleteButton} onPress={confirmDelete}>
-            <Text style={styles.deleteText}>Видалити</Text>
-          </Pressable>
-          <Pressable style={styles.cancelButton} onPress={resetForm}>
-            <Text style={styles.cancelText}>Скасувати</Text>
-          </Pressable>
-        </View>
-      )}
+        )}
+      </View>
 
       <FlatList
-        style={{ marginTop: 4 }}
-        contentContainerStyle={{ paddingBottom: 100 }}
+        style={{ marginTop: 6 }}
+        contentContainerStyle={{ paddingBottom: 110 }}
         data={tasks}
         keyExtractor={(item) => String(item.id)}
-        ListHeaderComponent={eventsBlock}
-        ListEmptyComponent={<Text style={styles.hint}>Завдань немає</Text>}
+        ListHeaderComponent={header}
+        ListEmptyComponent={
+          <View style={styles.emptyBox}>
+            <Text style={styles.emptyTitle}>Тиша і спокій</Text>
+            <Text style={styles.hint}>Додай справу, і я не дам про неї забути.</Text>
+          </View>
+        }
         renderItem={({ item }) => {
           const info = deadlineInfo(item.deadline);
           const isEditing = editing?.id === item.id;
           return (
-            <View style={[styles.task, isEditing && styles.taskEditing]}>
+            <View style={[styles.taskCard, isEditing && styles.taskEditing]}>
               <Pressable style={{ flex: 1 }} onPress={() => startEdit(item)}>
-                <Text style={styles.taskText}>{item.title}</Text>
-                {info && (
-                  <Text style={[styles.deadline, info.overdue && styles.deadlineOverdue]}>
-                    {info.text}
-                  </Text>
-                )}
+                <Text style={styles.taskTitle}>{item.title}</Text>
+                <View style={styles.badges}>
+                  {info && (
+                    <Text style={[styles.badge, info.overdue ? styles.badgeOverdue : styles.badgeDeadline]}>
+                      {info.text}
+                    </Text>
+                  )}
+                  <Text style={[styles.badge, styles.badgeCount]}>{nagBadge(item, settings)}</Text>
+                </View>
               </Pressable>
-              <Pressable style={styles.doneButton} onPress={() => doneTask(item.id)}>
-                <Text style={styles.doneText}>Готово</Text>
+              <Pressable
+                style={styles.doneButton}
+                onPress={() => doneTask(item.id)}
+                accessibilityLabel={`Готово: ${item.title}`}
+              >
+                <CheckIcon />
               </Pressable>
             </View>
           );
@@ -1257,8 +1441,11 @@ export default function App() {
 
       {lastDone && (
         <View style={styles.snackbar}>
+          <View style={styles.snackCheck}>
+            <CheckIcon size={18} color={C.ink} />
+          </View>
           <View style={{ flex: 1 }}>
-            <Text style={styles.snackTitle}>Виконано: {lastDone.title}</Text>
+            <Text style={styles.snackTitle}>{lastDone.title}: зроблено!</Text>
             <Text style={styles.snackSummary}>{lastDone.summary}</Text>
           </View>
           <Pressable style={styles.undoButton} onPress={undoLast}>
@@ -1272,58 +1459,90 @@ export default function App() {
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#fff', paddingTop: 60, paddingHorizontal: 16 },
-  screen: { flex: 1, backgroundColor: '#fff' },
-  scrollContent: { paddingTop: 60, paddingHorizontal: 16, paddingBottom: 40 },
-  header: { fontSize: 26, fontWeight: 'bold', marginBottom: 8 },
-  settingsLink: { color: '#2563eb', marginBottom: 12, lineHeight: 20 },
-  editTitle: { fontSize: 14, fontWeight: 'bold', color: '#b45309', marginBottom: 8 },
-  row: { flexDirection: 'row', marginBottom: 8 },
-  input: { flex: 1, borderWidth: 1, borderColor: '#ccc', borderRadius: 8, padding: 12, fontSize: 16 },
-  addButton: { backgroundColor: '#2563eb', borderRadius: 8, paddingHorizontal: 16, justifyContent: 'center', marginLeft: 8 },
-  eventButton: { backgroundColor: '#4338CA' },
-  addText: { color: '#fff', fontWeight: 'bold' },
-  task: { flexDirection: 'row', alignItems: 'center', padding: 12, borderWidth: 1, borderColor: '#eee', borderRadius: 8, marginBottom: 8 },
-  taskEditing: { borderColor: '#f59e0b', borderWidth: 2 },
-  taskText: { fontSize: 16 },
-  deadline: { fontSize: 13, color: '#b45309', marginTop: 4 },
-  deadlineOverdue: { color: '#b42318', fontWeight: 'bold' },
-  doneButton: { backgroundColor: '#16a34a', borderRadius: 6, paddingVertical: 6, paddingHorizontal: 12, marginLeft: 8 },
-  doneText: { color: '#fff' },
-  editActions: { flexDirection: 'row', marginBottom: 8 },
-  deleteButton: { flex: 1, borderWidth: 1, borderColor: '#b42318', borderRadius: 8, padding: 12, alignItems: 'center', marginRight: 8 },
-  deleteText: { color: '#b42318', fontWeight: 'bold' },
-  cancelButton: { flex: 1, borderWidth: 1, borderColor: '#ccc', borderRadius: 8, padding: 12, alignItems: 'center' },
-  cancelText: { color: '#333' },
-  eventRow: { flexDirection: 'row', alignItems: 'center', padding: 10, borderRadius: 8, backgroundColor: '#EEF2FF', marginBottom: 8 },
-  eventBadge: { backgroundColor: '#4338CA', borderRadius: 6, paddingVertical: 4, paddingHorizontal: 8, marginRight: 12, minWidth: 56, alignItems: 'center' },
-  eventBadgeText: { color: '#fff', fontWeight: 'bold', fontSize: 13 },
-  permissionButton: { padding: 12, alignItems: 'center', borderWidth: 1, borderColor: '#2563eb', borderStyle: 'dashed', borderRadius: 8, marginBottom: 8 },
-  halfTime: { flex: 1, marginRight: 8, marginBottom: 0 },
-  snackbar: { position: 'absolute', left: 16, right: 16, bottom: 32, flexDirection: 'row', alignItems: 'center', backgroundColor: '#16181D', borderRadius: 12, paddingVertical: 10, paddingLeft: 16, paddingRight: 8 },
-  snackTitle: { color: '#fff', fontWeight: 'bold' },
-  snackSummary: { color: '#C9CCD4', fontSize: 13, marginTop: 2 },
-  undoButton: { paddingVertical: 10, paddingHorizontal: 12 },
-  undoText: { color: '#FDBA74', fontWeight: 'bold' },
-  section: { fontSize: 16, fontWeight: 'bold', marginTop: 12, marginBottom: 8 },
-  switchRow: { flexDirection: 'row', alignItems: 'center', marginTop: 24, marginBottom: 8 },
-  hint: { color: '#555', marginBottom: 8 },
-  timeRow: { flexDirection: 'row', alignItems: 'flex-start' },
-  removeButton: { width: 48, height: 52, alignItems: 'center', justifyContent: 'center', marginLeft: 4 },
-  removeText: { fontSize: 18, color: '#b42318' },
-  addTimeButton: { padding: 12, alignItems: 'center', borderWidth: 1, borderColor: '#2563eb', borderStyle: 'dashed', borderRadius: 8 },
-  chips: { flexDirection: 'row', flexWrap: 'wrap' },
-  chip: { borderWidth: 1, borderColor: '#2563eb', borderRadius: 20, paddingVertical: 8, paddingHorizontal: 14, marginRight: 8, marginBottom: 8 },
-  chipActive: { backgroundColor: '#2563eb' },
-  chipText: { color: '#2563eb' },
-  chipTextActive: { color: '#fff' },
-  timeButton: { flexDirection: 'row', alignItems: 'center', borderWidth: 1, borderColor: '#ccc', borderRadius: 8, padding: 12, marginBottom: 8 },
-  timeLabel: { fontSize: 15, color: '#555', minWidth: 40 },
-  timeValue: { fontSize: 20, fontWeight: 'bold', marginLeft: 8, flex: 1 },
-  timeChange: { color: '#2563eb' },
-  saveButton: { backgroundColor: '#2563eb', borderRadius: 8, padding: 14, alignItems: 'center', marginTop: 24 },
-  backButton: { padding: 14, alignItems: 'center' },
-  backText: { color: '#666' },
-  testButton: { borderWidth: 1, borderColor: '#f59e0b', borderRadius: 8, padding: 14, alignItems: 'center', marginTop: 12 },
-  testText: { color: '#b45309' },
+  container: { flex: 1, backgroundColor: C.cream, paddingTop: 52, paddingHorizontal: 16 },
+  screen: { flex: 1, backgroundColor: C.cream },
+  scrollContent: { paddingTop: 52, paddingHorizontal: 16, paddingBottom: 40 },
+
+  headerRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  brand: { flexDirection: 'row', alignItems: 'center', gap: 10 },
+  logo: { width: 42, height: 42, borderRadius: 13, backgroundColor: C.green, alignItems: 'center', justifyContent: 'center' },
+  appName: { fontFamily: F.black, fontSize: 24, color: C.ink, lineHeight: 28 },
+  today: { fontFamily: F.regular, fontSize: 13, color: C.muted },
+  iconButton: { width: 44, height: 44, borderRadius: 22, backgroundColor: C.white, alignItems: 'center', justifyContent: 'center' },
+  settingsLine: { fontFamily: F.bold, fontSize: 13, color: C.green, marginTop: 10, marginBottom: 10 },
+
+  formCard: { backgroundColor: C.white, borderRadius: 24, padding: 14, gap: 12 },
+  editTitle: { fontFamily: F.extra, fontSize: 15, color: C.honeyText },
+  inputRow: { flexDirection: 'row', gap: 8 },
+  input: { flex: 1, height: 50, borderWidth: 2, borderColor: C.line, borderRadius: 14, paddingHorizontal: 14, fontSize: 16, fontFamily: F.bold, color: C.ink, backgroundColor: C.creamField },
+  addButton: { width: 50, height: 50, borderRadius: 14, backgroundColor: C.green, alignItems: 'center', justifyContent: 'center' },
+  linkSmall: { fontFamily: F.bold, fontSize: 13, color: C.green, marginTop: -2 },
+
+  segmented: { flexDirection: 'row', gap: 6, padding: 4, backgroundColor: C.mintLight, borderRadius: 14 },
+  segment: { flex: 1, height: 40, borderRadius: 11, alignItems: 'center', justifyContent: 'center' },
+  segmentActive: { backgroundColor: C.green },
+  segmentText: { fontFamily: F.bold, fontSize: 15, color: C.text },
+  segmentTextActive: { fontFamily: F.extra, color: C.white },
+
+  chips: { flexDirection: 'row', flexWrap: 'wrap', gap: 6 },
+  chip: { minHeight: 38, paddingHorizontal: 13, borderRadius: 19, borderWidth: 1.5, borderColor: C.line, backgroundColor: C.white, justifyContent: 'center' },
+  chipText: { fontFamily: F.bold, fontSize: 14, color: C.text },
+  chipSoftActive: { backgroundColor: C.mint, borderColor: C.mint },
+  chipSoftText: { fontFamily: F.extra, color: C.greenDark },
+  chipSolidActive: { backgroundColor: C.green, borderColor: C.green },
+  chipSolidText: { fontFamily: F.extra, color: C.white },
+
+  tileRow: { flexDirection: 'row', gap: 8, marginTop: 10, marginBottom: 6 },
+  timeTile: { flex: 1, minHeight: 62, borderRadius: 16, backgroundColor: C.mintLight, paddingHorizontal: 14, justifyContent: 'center' },
+  timeTileLabel: { fontFamily: F.bold, fontSize: 12, color: C.muted },
+  timeTileValue: { fontFamily: F.black, fontSize: 20, color: C.greenDark },
+
+  sectionTitle: { fontFamily: F.extra, fontSize: 15, color: C.text, marginTop: 12, marginBottom: 8 },
+  eventCard: { width: 150, backgroundColor: C.blueLight, borderRadius: 16, paddingVertical: 10, paddingHorizontal: 12 },
+  eventTime: { fontFamily: F.black, fontSize: 13, color: C.blue },
+  eventTitle: { fontFamily: F.bold, fontSize: 15, color: C.ink, marginTop: 2 },
+
+  taskCard: { flexDirection: 'row', alignItems: 'center', gap: 12, backgroundColor: C.white, borderRadius: 20, paddingVertical: 14, paddingLeft: 16, paddingRight: 14, marginBottom: 10 },
+  taskEditing: { borderWidth: 2, borderColor: C.honey },
+  taskTitle: { fontFamily: F.extra, fontSize: 17, color: C.ink },
+  badges: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 6 },
+  badge: { fontSize: 13, borderRadius: 8, paddingVertical: 2, paddingHorizontal: 8, overflow: 'hidden' },
+  badgeDeadline: { fontFamily: F.extra, color: C.honeyText, backgroundColor: C.honeyLight },
+  badgeOverdue: { fontFamily: F.extra, color: C.white, backgroundColor: C.red },
+  badgeCount: { fontFamily: F.bold, color: C.greenDark, backgroundColor: C.mintLight },
+  doneButton: { width: 48, height: 48, borderRadius: 24, borderWidth: 3, borderColor: C.green, backgroundColor: C.white, alignItems: 'center', justifyContent: 'center' },
+
+  emptyBox: { backgroundColor: C.white, borderRadius: 20, padding: 20, alignItems: 'center' },
+  emptyTitle: { fontFamily: F.black, fontSize: 18, color: C.ink, marginBottom: 4 },
+
+  editActions: { flexDirection: 'row', gap: 8 },
+  deleteButton: { flex: 1, minHeight: 46, borderRadius: 14, borderWidth: 2, borderColor: C.red, alignItems: 'center', justifyContent: 'center' },
+  deleteText: { fontFamily: F.extra, color: C.red, fontSize: 15 },
+  cancelButton: { flex: 1, minHeight: 46, borderRadius: 14, backgroundColor: C.mintLight, alignItems: 'center', justifyContent: 'center' },
+  cancelText: { fontFamily: F.extra, color: C.text, fontSize: 15 },
+
+  snackbar: { position: 'absolute', left: 14, right: 14, bottom: 24, flexDirection: 'row', alignItems: 'center', gap: 10, backgroundColor: C.greenDark, borderRadius: 18, paddingVertical: 10, paddingLeft: 14, paddingRight: 6 },
+  snackCheck: { width: 34, height: 34, borderRadius: 17, backgroundColor: C.honey, alignItems: 'center', justifyContent: 'center' },
+  snackTitle: { fontFamily: F.extra, fontSize: 15, color: C.white },
+  snackSummary: { fontFamily: F.regular, fontSize: 13, color: '#CDE8D8', marginTop: 1 },
+  undoButton: { paddingVertical: 10, paddingHorizontal: 10 },
+  undoText: { fontFamily: F.black, fontSize: 14, color: C.honey },
+
+  titleRow: { flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 16 },
+  screenTitle: { fontFamily: F.black, fontSize: 24, color: C.ink },
+  card: { backgroundColor: C.white, borderRadius: 22, padding: 16, marginBottom: 12 },
+  cardTitle: { fontFamily: F.extra, fontSize: 15, color: C.text, marginBottom: 10 },
+  switchRow: { flexDirection: 'row', alignItems: 'center' },
+  hint: { fontFamily: F.regular, fontSize: 14, color: C.muted, marginBottom: 8 },
+  summaryTimeRow: { flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 8 },
+  removeButton: { width: 44, height: 44, alignItems: 'center', justifyContent: 'center' },
+  removeText: { fontSize: 18, color: C.red },
+  dashedButton: { minHeight: 46, borderRadius: 14, borderWidth: 1.5, borderStyle: 'dashed', borderColor: C.green, alignItems: 'center', justifyContent: 'center', marginTop: 4 },
+  linkText: { fontFamily: F.extra, color: C.green, fontSize: 15 },
+  primaryButton: { minHeight: 54, borderRadius: 18, backgroundColor: C.green, alignItems: 'center', justifyContent: 'center', marginTop: 8 },
+  primaryButtonText: { fontFamily: F.black, fontSize: 17, color: C.white },
+  ghostButton: { minHeight: 44, alignItems: 'center', justifyContent: 'center' },
+  ghostButtonText: { fontFamily: F.bold, fontSize: 15, color: C.muted },
+  testButton: { minHeight: 46, borderRadius: 14, borderWidth: 1.5, borderColor: C.honey, alignItems: 'center', justifyContent: 'center', marginBottom: 8 },
+  testText: { fontFamily: F.bold, color: C.honeyText, fontSize: 15 },
 });
