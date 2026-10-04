@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react';
 import { StatusBar } from 'expo-status-bar';
 import {
   StyleSheet, Text, TextInput, Pressable, View, FlatList, Keyboard, Alert,
-  ScrollView, Switch, AppState, LayoutAnimation,
+  ScrollView, Switch, AppState, LayoutAnimation, Linking,
 } from 'react-native';
 import * as SQLite from 'expo-sqlite';
 import * as Notifications from 'expo-notifications';
@@ -14,6 +14,7 @@ import {
 } from '@expo-google-fonts/nunito';
 
 const APP_NAME = 'Тук-тук';
+const PRIVACY_URL = 'https://valentinasotnichuk18-pixel.github.io/nag-reminder/privacy-policy.html';
 
 // ---------- Кольори і шрифти ----------
 
@@ -867,6 +868,22 @@ function PencilIcon({ size = 18, color = C.blue }) {
   );
 }
 
+function CalendarIcon({ size = 22, color = C.blue }) {
+  return (
+    <Svg width={size} height={size} viewBox="0 0 24 24">
+      <Path d="M5 5h14a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2zM16 3v4M8 3v4M3 11h18" fill="none" stroke={color} strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" />
+    </Svg>
+  );
+}
+
+function BatteryIcon({ size = 22, color = C.green }) {
+  return (
+    <Svg width={size} height={size} viewBox="0 0 24 24">
+      <Path d="M4 7h13a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V8a1 1 0 0 1 1-1zM21 11v2M7 12h4M9 10v4" fill="none" stroke={color} strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" />
+    </Svg>
+  );
+}
+
 // ---------- Спільні компоненти ----------
 
 // variant "solid": вибране зелене; "soft": вибране м'ятне
@@ -939,7 +956,7 @@ function pickMinutes(value, onChange) {
 
 // ---------- Налаштування ----------
 
-function SettingsScreen({ onBack }) {
+function SettingsScreen({ onBack, onHelp }) {
   const initial = loadSettings();
   const [intervalMin, setIntervalMin] = useState(initial.intervalMin);
   const [startMin, setStartMin] = useState(initial.startMin);
@@ -1072,6 +1089,19 @@ function SettingsScreen({ onBack }) {
       </Pressable>
 
       <View style={[styles.card, { marginTop: 16 }]}>
+        <Text style={styles.cardTitle}>Довідка</Text>
+        <Pressable style={styles.menuRow} onPress={onHelp}>
+          <Text style={styles.menuText}>Як користуватися Тук-тук</Text>
+        </Pressable>
+        <Pressable style={styles.menuRow} onPress={() => Linking.openSettings()}>
+          <Text style={styles.menuText}>Дозволи і батарея</Text>
+        </Pressable>
+        <Pressable style={[styles.menuRow, { borderBottomWidth: 0 }]} onPress={() => Linking.openURL(PRIVACY_URL)}>
+          <Text style={styles.menuText}>Політика конфіденційності</Text>
+        </Pressable>
+      </View>
+
+      <View style={styles.card}>
         <Text style={styles.cardTitle}>Для тестування</Text>
         <Pressable style={styles.testButton} onPress={sendTestNotification}>
           <Text style={styles.testText}>Нагадування через 10 секунд</Text>
@@ -1082,6 +1112,99 @@ function SettingsScreen({ onBack }) {
       </View>
       <StatusBar style="dark" />
     </ScrollView>
+  );
+}
+
+// ---------- Довідка (перший запуск і з налаштувань) ----------
+
+const HELP_SLIDES = [
+  {
+    icon: 'bell',
+    title: 'Тук-тук!',
+    text: 'Звичайні нагадувалки дзенькнуть один раз, і справа губиться. Я нагадую знову і знову, поки ти не натиснеш «Готово».',
+  },
+  {
+    icon: 'plus',
+    title: 'Додай справу',
+    text: 'Напиши, що треба зробити, і за бажанням постав дедлайн. Я тукатиму з інтервалом, який ти обереш (від 15 хвилин до 3 годин), і тільки у твої години.',
+  },
+  {
+    icon: 'check',
+    title: 'Готово або пізніше',
+    text: 'У сповіщенні дві кнопки: «Готово» закриває справу, «Через 15 хв» дає коротку паузу. Закрила випадково? Натисни «Повернути». Натисни на справу, щоб змінити або видалити її.',
+  },
+  {
+    icon: 'calendar',
+    title: 'Події і зведення',
+    text: 'Перемкнись на «Подія», і я запишу її в Google Календар. Кілька разів на день надсилатиму зведення всіх справ. Усе виконане чекає в історії (значок годинника вгорі).',
+  },
+  {
+    icon: 'battery',
+    title: 'Щоб я не мовчала',
+    text: 'Дозволь сповіщення, інакше нагадування не прийдуть. Ще порада: у налаштуваннях телефона встанови для Тук-тук батарею «Без обмежень», щоб система не приспала нагадування.',
+  },
+];
+
+function HelpIcon({ name }) {
+  if (name === 'bell') return <BellIcon size={64} color={C.green} />;
+  if (name === 'plus') return <PlusIcon size={60} color={C.green} />;
+  if (name === 'check') return <CheckIcon size={60} color={C.green} />;
+  if (name === 'calendar') return <CalendarIcon size={58} />;
+  return <BatteryIcon size={60} />;
+}
+
+function OnboardingScreen({ onDone, firstRun }) {
+  const [index, setIndex] = useState(0);
+  const slide = HELP_SLIDES[index];
+  const isLast = index === HELP_SLIDES.length - 1;
+
+  return (
+    <View style={[styles.container, { paddingBottom: 32, justifyContent: 'space-between' }]}>
+      <View style={{ alignItems: 'flex-end' }}>
+        {!isLast && (
+          <Pressable style={styles.ghostButton} onPress={onDone}>
+            <Text style={styles.ghostButtonText}>{firstRun ? 'Пропустити' : 'Закрити'}</Text>
+          </Pressable>
+        )}
+      </View>
+
+      <View style={{ alignItems: 'center', gap: 24 }}>
+        <View style={styles.helpArt}>
+          <HelpIcon name={slide.icon} />
+        </View>
+        <Text style={styles.helpTitle}>{slide.title}</Text>
+        <Text style={styles.helpText}>{slide.text}</Text>
+      </View>
+
+      <View style={{ gap: 12 }}>
+        <View style={styles.dots}>
+          {HELP_SLIDES.map((s, i) => (
+            <View key={s.title} style={[styles.dot, i === index && styles.dotActive]} />
+          ))}
+        </View>
+
+        {isLast && (
+          <Pressable style={styles.secondaryButton} onPress={() => Linking.openSettings()}>
+            <Text style={styles.secondaryButtonText}>Відкрити налаштування застосунку</Text>
+          </Pressable>
+        )}
+
+        <View style={{ flexDirection: 'row', gap: 8 }}>
+          {index > 0 && (
+            <Pressable style={[styles.secondaryButton, { flex: 1 }]} onPress={() => setIndex(index - 1)}>
+              <Text style={styles.secondaryButtonText}>Назад</Text>
+            </Pressable>
+          )}
+          <Pressable
+            style={[styles.primaryButton, { flex: 2, marginTop: 0 }]}
+            onPress={() => (isLast ? onDone() : setIndex(index + 1))}
+          >
+            <Text style={styles.primaryButtonText}>{isLast ? (firstRun ? 'Почати' : 'Зрозуміло') : 'Далі'}</Text>
+          </Pressable>
+        </View>
+      </View>
+      <StatusBar style="dark" />
+    </View>
   );
 }
 
@@ -1212,6 +1335,7 @@ export default function App() {
     Nunito_500Medium, Nunito_700Bold, Nunito_800ExtraBold, Nunito_900Black,
   });
 
+  const [onboarded, setOnboarded] = useState(() => getSetting('onboarding_done', 0) === 1);
   const [screen, setScreen] = useState('tasks');
   const [kind, setKind] = useState('task');
   const [text, setText] = useState('');
@@ -1258,7 +1382,8 @@ export default function App() {
       }
     };
 
-    setupNotifications().then(rescheduleAll);
+    // На першому запуску дозвіл питаємо після довідки, а не одразу
+    if (getSetting('onboarding_done', 0) === 1) setupNotifications().then(rescheduleAll);
     refreshEvents(false);
     Notifications.getLastNotificationResponseAsync().then(handleResponse);
     const sub = Notifications.addNotificationResponseReceivedListener(handleResponse);
@@ -1293,9 +1418,26 @@ export default function App() {
     return <View style={{ flex: 1, backgroundColor: C.cream }} />;
   }
 
+  if (!onboarded || screen === 'help') {
+    return (
+      <OnboardingScreen
+        firstRun={!onboarded}
+        onDone={() => {
+          if (!onboarded) {
+            setSetting('onboarding_done', 1);
+            setOnboarded(true);
+            setupNotifications().then(rescheduleAll);
+          }
+          setScreen('tasks');
+        }}
+      />
+    );
+  }
+
   if (screen === 'settings') {
     return (
       <SettingsScreen
+        onHelp={() => setScreen('help')}
         onBack={(changed) => {
           setSettings(loadSettings());
           if (changed) rescheduleAll();
@@ -1882,6 +2024,17 @@ const styles = StyleSheet.create({
   restoreText: { fontFamily: F.extra, fontSize: 14, color: C.green },
   taskTitleDone: { textDecorationLine: 'line-through', color: C.muted },
   doneButtonActive: { backgroundColor: C.green },
+
+  helpArt: { width: 140, height: 140, borderRadius: 44, backgroundColor: C.mint, alignItems: 'center', justifyContent: 'center' },
+  helpTitle: { fontFamily: F.black, fontSize: 28, color: C.ink, textAlign: 'center' },
+  helpText: { fontFamily: F.bold, fontSize: 17, lineHeight: 25, color: C.text, textAlign: 'center', paddingHorizontal: 8 },
+  dots: { flexDirection: 'row', justifyContent: 'center', gap: 8, marginBottom: 8 },
+  dot: { width: 8, height: 8, borderRadius: 4, backgroundColor: C.line },
+  dotActive: { width: 24, backgroundColor: C.green },
+  secondaryButton: { minHeight: 54, borderRadius: 18, backgroundColor: C.mintLight, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 12 },
+  secondaryButtonText: { fontFamily: F.extra, fontSize: 16, color: C.greenDark },
+  menuRow: { minHeight: 48, justifyContent: 'center', borderBottomWidth: 1, borderBottomColor: C.mintLight },
+  menuText: { fontFamily: F.bold, fontSize: 16, color: C.ink },
 
   taskCard: { flexDirection: 'row', alignItems: 'center', gap: 12, backgroundColor: C.white, borderRadius: 20, paddingVertical: 14, paddingLeft: 16, paddingRight: 14, marginBottom: 10 },
   taskEditing: { borderWidth: 2, borderColor: C.honey },
