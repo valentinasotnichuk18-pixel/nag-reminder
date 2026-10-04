@@ -2,10 +2,11 @@ import { useState, useEffect } from 'react';
 import { StatusBar } from 'expo-status-bar';
 import {
   StyleSheet, Text, TextInput, Pressable, View, FlatList, Keyboard, Alert,
-  ScrollView, Switch,
+  ScrollView, Switch, AppState,
 } from 'react-native';
 import * as SQLite from 'expo-sqlite';
 import * as Notifications from 'expo-notifications';
+import * as Calendar from 'expo-calendar/legacy';
 import { DateTimePickerAndroid } from '@react-native-community/datetimepicker';
 
 const db = SQLite.openDatabaseSync('tasks.db');
@@ -46,6 +47,16 @@ const SNOOZE_MIN = 15;
 const SNOOZE_PREFIX = 'snooze-';
 const MAX_SUMMARY_TIMES = 6;
 const MAX_SUMMARY_LINES = 8;
+const MAX_SUMMARY_EVENTS = 5;
+const SUMMARY_DAYS_AHEAD = 7;
+
+const TIME_ZONE = (() => {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || 'Europe/Kiev';
+  } catch (e) {
+    return 'Europe/Kiev';
+  }
+})();
 
 const INTERVALS = [
   { min: 15, label: '15 хв' },
@@ -66,6 +77,20 @@ const DEADLINE_DAYS = [
   { key: 'today', label: 'Сьогодні' },
   { key: 'tomorrow', label: 'Завтра' },
   { key: 'pick', label: 'Обрати дату' },
+];
+
+const EVENT_DAYS = DEADLINE_DAYS.filter((d) => d.key !== 'none');
+
+const EVENT_REMINDERS = [
+  { key: 15, label: 'за 15 хв' },
+  { key: 30, label: 'за 30 хв' },
+  { key: 60, label: 'за 1 год' },
+  { key: 1440, label: 'за день' },
+];
+
+const KINDS = [
+  { key: 'task', label: 'Завдання' },
+  { key: 'event', label: 'Подія' },
 ];
 
 function nagTitle(order) {
@@ -97,14 +122,43 @@ function isSameDay(a, b) {
   return a.toDateString() === b.toDateString();
 }
 
+function addDays(d, days) {
+  const r = new Date(d);
+  r.setDate(r.getDate() + days);
+  return r;
+}
+
+function startOfDay(d) {
+  const r = new Date(d);
+  r.setHours(0, 0, 0, 0);
+  return r;
+}
+
+function endOfDay(d) {
+  const r = new Date(d);
+  r.setHours(23, 59, 59, 999);
+  return r;
+}
+
 function modeForDate(d) {
   if (!d) return 'none';
   const now = new Date();
-  const tomorrow = new Date(now);
-  tomorrow.setDate(now.getDate() + 1);
   if (isSameDay(d, now)) return 'today';
-  if (isSameDay(d, tomorrow)) return 'tomorrow';
+  if (isSameDay(d, addDays(now, 1))) return 'tomorrow';
   return 'pick';
+}
+
+function withDay(target, daySource) {
+  const d = new Date(target);
+  d.setFullYear(daySource.getFullYear(), daySource.getMonth(), daySource.getDate());
+  return d;
+}
+
+function nextFullHour() {
+  const d = new Date();
+  d.setMinutes(0, 0, 0);
+  d.setHours(d.getHours() + 1);
+  return d;
 }
 
 function deadlineInfo(iso) {
@@ -114,12 +168,8 @@ function deadlineInfo(iso) {
   const time = formatTime(d);
 
   if (d < now) return { text: 'прострочено', overdue: true };
-
-  const tomorrow = new Date(now);
-  tomorrow.setDate(now.getDate() + 1);
-
   if (isSameDay(d, now)) return { text: `до ${time}`, overdue: false };
-  if (isSameDay(d, tomorrow)) return { text: `завтра до ${time}`, overdue: false };
+  if (isSameDay(d, addDays(now, 1))) return { text: `завтра до ${time}`, overdue: false };
   return { text: `${formatDate(d)} до ${time}`, overdue: false };
 }
 
@@ -190,6 +240,63 @@ function intervalLabel(min) {
   return found ? found.label : `${min} хв`;
 }
 
+// ---------- Календар ----------
+
+async function hasCalendarPermission(ask) {
+  const { status } = ask
+    ? await Calendar.requestCalendarPermissionsAsync()
+    : await Calendar.getCalendarPermissionsAsync();
+  return status === 'granted';
+}
+
+async function getMainCalendar() {
+  const calendars = await Calendar.getCalendarsAsync(Calendar.EntityTypes.EVENT);
+  const writable = calendars.filter((c) => c.allowsModifications);
+  const owner = Calendar.CalendarAccessLevel.OWNER;
+  return (
+    writable.find((c) => c.isPrimary) ||
+    writable.find((c) => c.source?.type === 'com.google' && c.accessLevel === owner) ||
+    writable.find((c) => c.accessLevel === owner) ||
+    writable[0] ||
+    null
+  );
+}
+
+// Події головного календаря за період. null: немає дозволу
+async function loadEvents(from, to, ask = false) {
+  try {
+    if (!(await hasCalendarPermission(ask))) return null;
+    const calendar = await getMainCalendar();
+    if (!calendar) return [];
+    const events = await Calendar.getEventsAsync([calendar.id], from, to);
+    return events
+      .map((e) => {
+        const start = new Date(e.startDate);
+        return {
+          // Повторювані події мають однаковий id, тому додаємо час початку
+          key: `${e.id}-${start.getTime()}`,
+          title: e.title || '(без назви)',
+          start,
+          allDay: e.allDay,
+        };
+      })
+      .sort((a, b) => a.start - b.start);
+  } catch (e) {
+    console.warn(e);
+    return [];
+  }
+}
+
+// Події від цього моменту до кінця дня (як у зведенні в n8n)
+function loadTodayEvents(ask = false) {
+  const now = new Date();
+  return loadEvents(now, endOfDay(now), ask);
+}
+
+function eventTime(e) {
+  return e.allDay ? 'весь день' : formatTime(e.start);
+}
+
 // ---------- Розклад нагадувань ----------
 
 function slotsFor(createdAtIso, s) {
@@ -211,8 +318,7 @@ function countReminders(createdIso, doneIso, s) {
   const done = new Date(doneIso);
   const slots = slotsFor(createdIso, s);
   let count = 0;
-  const day = new Date(created);
-  day.setHours(0, 0, 0, 0);
+  const day = startOfDay(created);
   while (day <= done) {
     for (const slot of slots) {
       const t = new Date(day);
@@ -250,7 +356,6 @@ function doneSummary(task) {
 
 // ---------- Зведення ----------
 
-// Коли надсилати зведення (хвилини від початку доби)
 function summarySlots(s) {
   if (!s.summaryEnabled) return [];
   if (s.summaryMode === 'times') {
@@ -278,13 +383,13 @@ function tasksWord(n) {
 }
 
 function loadSummaryTasks() {
-  // Спочатку з найближчим дедлайном, потім без дедлайну
   return db.getAllSync(
     "SELECT title, deadline FROM tasks WHERE status = 'active' ORDER BY deadline IS NULL, deadline, id"
   );
 }
 
-function summaryContent(list) {
+// dayEvents: події того дня, на який заплановане зведення
+function summaryContent(list, dayEvents) {
   const lines = list.slice(0, MAX_SUMMARY_LINES).map((t, i) => {
     if (!t.deadline) return `${i + 1}. ${t.title}`;
     const d = new Date(t.deadline);
@@ -293,11 +398,24 @@ function summaryContent(list) {
   if (list.length > MAX_SUMMARY_LINES) {
     lines.push(`і ще ${list.length - MAX_SUMMARY_LINES}`);
   }
+  const upcoming = dayEvents.slice(0, MAX_SUMMARY_EVENTS);
+  if (upcoming.length) {
+    if (lines.length) lines.push('');
+    lines.push('Сьогодні в календарі:');
+    for (const e of upcoming) lines.push(`• ${eventTime(e)} ${e.title}`);
+  }
   return {
-    title: `${list.length} ${tasksWord(list.length)}`,
+    title: list.length ? `${list.length} ${tasksWord(list.length)}` : 'Сьогодні в календарі',
     body: lines.join('\n'),
     data: { type: 'summary' },
   };
+}
+
+// Події, які ще актуальні на момент зведення: того ж дня і ще не почались
+function eventsForSummaryAt(time, events) {
+  return events.filter(
+    (e) => isSameDay(e.start, time) && (e.allDay || e.start >= time)
+  );
 }
 
 // ---------- Сповіщення ----------
@@ -347,7 +465,7 @@ async function doReschedule() {
     "SELECT id, title, created_at, deadline FROM tasks WHERE status = 'active'"
   );
 
-  // Нагадування про кожне завдання
+  // Нав'язливі нагадування про завдання: щодня, завжди
   for (const t of active) {
     for (const slot of slotsFor(t.created_at, s)) {
       await Notifications.scheduleNotificationAsync({
@@ -367,16 +485,30 @@ async function doReschedule() {
     }
   }
 
-  // Зведення (тільки якщо є активні завдання)
-  if (active.length > 0) {
-    const content = summaryContent(loadSummaryTasks());
-    for (const m of summarySlots(s)) {
+  // Зведення: окремо на кожен день, з подіями саме цього дня
+  const slots = summarySlots(s);
+  if (slots.length === 0) return;
+
+  const now = new Date();
+  const events =
+    (await loadEvents(now, endOfDay(addDays(now, SUMMARY_DAYS_AHEAD - 1)), false)) || [];
+  const taskList = loadSummaryTasks();
+
+  for (let day = 0; day < SUMMARY_DAYS_AHEAD; day += 1) {
+    const date = startOfDay(addDays(now, day));
+    for (const m of slots) {
+      const time = new Date(date);
+      time.setHours(Math.floor(m / 60), m % 60, 0, 0);
+      if (time <= now) continue;
+
+      const dayEvents = eventsForSummaryAt(time, events);
+      if (taskList.length === 0 && dayEvents.length === 0) continue;
+
       await Notifications.scheduleNotificationAsync({
-        content,
+        content: summaryContent(taskList, dayEvents),
         trigger: {
-          type: Notifications.SchedulableTriggerInputTypes.DAILY,
-          hour: Math.floor(m / 60),
-          minute: m % 60,
+          type: Notifications.SchedulableTriggerInputTypes.DATE,
+          date: time,
           channelId: CHANNEL_ID,
         },
       });
@@ -489,11 +621,12 @@ async function sendTestNotification() {
 
 async function sendTestSummary() {
   const list = loadSummaryTasks();
-  if (list.length === 0) {
-    Alert.alert('Немає завдань', 'Зведення приходить, тільки коли є активні завдання.');
+  const events = (await loadTodayEvents(false)) || [];
+  if (list.length === 0 && events.length === 0) {
+    Alert.alert('Немає справ', 'Зведення приходить, тільки коли є завдання або події на сьогодні.');
     return;
   }
-  const content = summaryContent(list);
+  const content = summaryContent(list, events);
   await Notifications.scheduleNotificationAsync({
     content: { ...content, title: `${content.title} (тест)` },
     trigger: {
@@ -505,7 +638,7 @@ async function sendTestSummary() {
   Alert.alert('Тест', 'Згорни застосунок, зведення прийде через 10 секунд.');
 }
 
-// ---------- Екрани ----------
+// ---------- Компоненти ----------
 
 function TimeField({ label, value, onChange }) {
   const open = () => {
@@ -676,20 +809,34 @@ function SettingsScreen({ onBack }) {
   );
 }
 
+// ---------- Головний екран ----------
+
 export default function App() {
   const [screen, setScreen] = useState('tasks');
+  const [kind, setKind] = useState('task');
   const [text, setText] = useState('');
+
   const [deadlineMode, setDeadlineMode] = useState('none');
   const [deadline, setDeadline] = useState(null);
   const [editing, setEditing] = useState(null);
+
+  const [eventStart, setEventStart] = useState(nextFullHour);
+  const [eventEnd, setEventEnd] = useState(() => new Date(nextFullHour().getTime() + 3600000));
+  const [eventReminder, setEventReminder] = useState(30);
+  const [events, setEvents] = useState(undefined);
+
   const [lastDone, setLastDone] = useState(null);
-  const [snoozeInfo, setSnoozeInfo] = useState(null);
+  const [infoMsg, setInfoMsg] = useState(null);
   const [tasks, setTasks] = useState(loadTasks);
   const [settings, setSettings] = useState(loadSettings);
 
   const showDone = (task) => {
     if (!task) return;
     setLastDone({ id: task.id, title: task.title, summary: doneSummary(task) });
+  };
+
+  const refreshEvents = async (ask) => {
+    setEvents(await loadTodayEvents(ask));
   };
 
   useEffect(() => {
@@ -701,14 +848,27 @@ export default function App() {
         setTasks(loadTasks());
       } else if (response.actionIdentifier === 'snooze') {
         const t = await snoozeTask(taskId);
-        if (t) setSnoozeInfo(`«${t.title}» нагадаю через ${SNOOZE_MIN} хв`);
+        if (t) setInfoMsg(`«${t.title}» нагадаю через ${SNOOZE_MIN} хв`);
       }
     };
 
     setupNotifications().then(rescheduleAll);
+    refreshEvents(false);
     Notifications.getLastNotificationResponseAsync().then(handleResponse);
     const sub = Notifications.addNotificationResponseReceivedListener(handleResponse);
-    return () => sub.remove();
+
+    const appSub = AppState.addEventListener('change', (state) => {
+      if (state === 'active') {
+        refreshEvents(false);
+        setTasks(loadTasks());
+        rescheduleAll();
+      }
+    });
+
+    return () => {
+      sub.remove();
+      appSub.remove();
+    };
   }, []);
 
   useEffect(() => {
@@ -718,10 +878,10 @@ export default function App() {
   }, [lastDone]);
 
   useEffect(() => {
-    if (!snoozeInfo) return undefined;
-    const timer = setTimeout(() => setSnoozeInfo(null), 4000);
+    if (!infoMsg) return undefined;
+    const timer = setTimeout(() => setInfoMsg(null), 4000);
     return () => clearTimeout(timer);
-  }, [snoozeInfo]);
+  }, [infoMsg]);
 
   if (screen === 'settings') {
     return (
@@ -734,6 +894,8 @@ export default function App() {
       />
     );
   }
+
+  // ----- Завдання -----
 
   const keptHours = deadline ? deadline.getHours() : 18;
   const keptMinutes = deadline ? deadline.getMinutes() : 0;
@@ -760,8 +922,7 @@ export default function App() {
       return;
     }
 
-    const d = new Date();
-    if (key === 'tomorrow') d.setDate(d.getDate() + 1);
+    const d = key === 'tomorrow' ? addDays(new Date(), 1) : new Date();
     d.setHours(keptHours, keptMinutes, 0, 0);
     setDeadline(d);
     setDeadlineMode(key);
@@ -784,11 +945,15 @@ export default function App() {
     setDeadlineMode('none');
     setDeadline(null);
     setEditing(null);
+    const start = nextFullHour();
+    setEventStart(start);
+    setEventEnd(new Date(start.getTime() + 3600000));
     Keyboard.dismiss();
   };
 
   const startEdit = (item) => {
     const d = item.deadline ? new Date(item.deadline) : null;
+    setKind('task');
     setEditing({ id: item.id, originalDeadline: item.deadline });
     setText(item.title);
     setDeadline(d);
@@ -855,6 +1020,118 @@ export default function App() {
     setTasks(loadTasks());
   };
 
+  // ----- Подія -----
+
+  const chooseEventDay = (key) => {
+    if (key === 'pick') {
+      openPicker({
+        value: eventStart,
+        mode: 'date',
+        minimumDate: new Date(),
+        onPick: (date) => {
+          setEventStart(withDay(eventStart, date));
+          setEventEnd(withDay(eventEnd, date));
+        },
+      });
+      return;
+    }
+    const day = key === 'tomorrow' ? addDays(new Date(), 1) : new Date();
+    setEventStart(withDay(eventStart, day));
+    setEventEnd(withDay(eventEnd, day));
+  };
+
+  const pickEventTime = (which) => {
+    const current = which === 'start' ? eventStart : eventEnd;
+    openPicker({
+      value: current,
+      mode: 'time',
+      onPick: (date) => {
+        const d = new Date(current);
+        d.setHours(date.getHours(), date.getMinutes(), 0, 0);
+        if (which === 'start') {
+          setEventStart(d);
+          if (eventEnd <= d) setEventEnd(new Date(d.getTime() + 3600000));
+        } else {
+          setEventEnd(d);
+        }
+      },
+    });
+  };
+
+  const saveEvent = async () => {
+    const title = text.trim();
+    if (!title) return;
+
+    if (eventStart < new Date()) {
+      Alert.alert('Цей час уже минув', 'Обери пізніший час або інший день.');
+      return;
+    }
+    if (eventEnd <= eventStart) {
+      Alert.alert('Помилка', 'Кінець події має бути пізніше за початок.');
+      return;
+    }
+
+    try {
+      if (!(await hasCalendarPermission(true))) {
+        Alert.alert(
+          'Немає доступу до календаря',
+          'Щоб додавати події, дозволь доступ до календаря в налаштуваннях телефона.'
+        );
+        return;
+      }
+      const calendar = await getMainCalendar();
+      if (!calendar) {
+        Alert.alert(
+          'Календар не знайдено',
+          'Додай Google акаунт у налаштуваннях телефона, щоб записувати події.'
+        );
+        return;
+      }
+      await Calendar.createEventAsync(calendar.id, {
+        title,
+        startDate: eventStart,
+        endDate: eventEnd,
+        timeZone: TIME_ZONE,
+        alarms: [{ relativeOffset: -eventReminder, method: Calendar.AlarmMethod.ALERT }],
+      });
+      setInfoMsg(`Подію додано в календар «${calendar.title}»`);
+      resetForm();
+      await refreshEvents(false);
+      rescheduleAll();
+    } catch (e) {
+      console.warn(e);
+      Alert.alert('Не вдалося додати подію', String(e?.message ?? e));
+    }
+  };
+
+  // ----- Екран -----
+
+  const isEvent = kind === 'event';
+
+  const eventsBlock = (
+    <View>
+      <Text style={styles.section}>Сьогодні в календарі</Text>
+      {events === null && (
+        <Pressable style={styles.permissionButton} onPress={() => refreshEvents(true)}>
+          <Text style={styles.timeChange}>Показати події з календаря</Text>
+        </Pressable>
+      )}
+      {Array.isArray(events) && events.length === 0 && (
+        <Text style={styles.hint}>На сьогодні подій більше немає</Text>
+      )}
+      {Array.isArray(events) &&
+        events.map((e) => (
+          <View key={e.key} style={styles.eventRow}>
+            <View style={styles.eventBadge}>
+              <Text style={styles.eventBadgeText}>{eventTime(e)}</Text>
+            </View>
+            <Text style={[styles.taskText, { flex: 1 }]}>{e.title}</Text>
+          </View>
+        ))}
+      <Text style={styles.section}>Завдання</Text>
+    </View>
+  );
+
   return (
     <View style={styles.container}>
       <Text style={styles.header}>Мої завдання</Text>
@@ -866,43 +1143,71 @@ export default function App() {
         </Text>
       </Pressable>
 
-      {editing && <Text style={styles.editTitle}>Редагування завдання</Text>}
+      {editing ? (
+        <Text style={styles.editTitle}>Редагування завдання</Text>
+      ) : (
+        <Chips items={KINDS} value={kind} onChange={setKind} />
+      )}
 
       <View style={styles.row}>
         <TextInput
           style={styles.input}
-          placeholder="Що треба зробити?"
+          placeholder={isEvent ? 'Назва події' : 'Що треба зробити?'}
           value={text}
           onChangeText={setText}
-          onSubmitEditing={saveTask}
+          onSubmitEditing={isEvent ? saveEvent : saveTask}
         />
-        <Pressable style={styles.addButton} onPress={saveTask}>
+        <Pressable
+          style={[styles.addButton, isEvent && styles.eventButton]}
+          onPress={isEvent ? saveEvent : saveTask}
+        >
           <Text style={styles.addText}>{editing ? 'Зберегти' : 'Додати'}</Text>
         </Pressable>
       </View>
 
-      <View style={styles.chips}>
-        {DEADLINE_DAYS.map((d) => {
-          const active = deadlineMode === d.key;
-          const label = d.key === 'pick' && active && deadline ? formatDate(deadline) : d.label;
-          return (
-            <Pressable
-              key={d.key}
-              style={[styles.chip, active && styles.chipActive]}
-              onPress={() => chooseDay(d.key)}
-            >
-              <Text style={[styles.chipText, active && styles.chipTextActive]}>{label}</Text>
+      {!isEvent && (
+        <View>
+          <Chips
+            items={DEADLINE_DAYS.map((d) => ({
+              key: d.key,
+              label: d.key === 'pick' && deadlineMode === 'pick' && deadline ? formatDate(deadline) : d.label,
+            }))}
+            value={deadlineMode}
+            onChange={chooseDay}
+          />
+          {deadline && (
+            <Pressable style={styles.timeButton} onPress={pickTime}>
+              <Text style={styles.timeLabel}>Дедлайн о</Text>
+              <Text style={styles.timeValue}>{formatTime(deadline)}</Text>
+              <Text style={styles.timeChange}>Змінити час</Text>
             </Pressable>
-          );
-        })}
-      </View>
+          )}
+        </View>
+      )}
 
-      {deadline && (
-        <Pressable style={styles.timeButton} onPress={pickTime}>
-          <Text style={styles.timeLabel}>Дедлайн о</Text>
-          <Text style={styles.timeValue}>{formatTime(deadline)}</Text>
-          <Text style={styles.timeChange}>Змінити час</Text>
-        </Pressable>
+      {isEvent && (
+        <View>
+          <Chips
+            items={EVENT_DAYS.map((d) => ({
+              key: d.key,
+              label: d.key === 'pick' && modeForDate(eventStart) === 'pick' ? formatDate(eventStart) : d.label,
+            }))}
+            value={modeForDate(eventStart)}
+            onChange={chooseEventDay}
+          />
+          <View style={styles.row}>
+            <Pressable style={[styles.timeButton, styles.halfTime]} onPress={() => pickEventTime('start')}>
+              <Text style={styles.timeLabel}>Початок</Text>
+              <Text style={styles.timeValue}>{formatTime(eventStart)}</Text>
+            </Pressable>
+            <Pressable style={[styles.timeButton, styles.halfTime, { marginRight: 0 }]} onPress={() => pickEventTime('end')}>
+              <Text style={styles.timeLabel}>Кінець</Text>
+              <Text style={styles.timeValue}>{formatTime(eventEnd)}</Text>
+            </Pressable>
+          </View>
+          <Text style={styles.hint}>Нагадати:</Text>
+          <Chips items={EVENT_REMINDERS} value={eventReminder} onChange={setEventReminder} />
+        </View>
       )}
 
       {editing && (
@@ -917,11 +1222,12 @@ export default function App() {
       )}
 
       <FlatList
-        style={{ marginTop: 8 }}
+        style={{ marginTop: 4 }}
         contentContainerStyle={{ paddingBottom: 100 }}
         data={tasks}
         keyExtractor={(item) => String(item.id)}
-        ListEmptyComponent={<Text style={styles.empty}>Завдань немає</Text>}
+        ListHeaderComponent={eventsBlock}
+        ListEmptyComponent={<Text style={styles.hint}>Завдань немає</Text>}
         renderItem={({ item }) => {
           const info = deadlineInfo(item.deadline);
           const isEditing = editing?.id === item.id;
@@ -943,9 +1249,9 @@ export default function App() {
         }}
       />
 
-      {snoozeInfo && !lastDone && (
+      {infoMsg && !lastDone && (
         <View style={styles.snackbar}>
-          <Text style={[styles.snackTitle, { flex: 1, paddingVertical: 8 }]}>{snoozeInfo}</Text>
+          <Text style={[styles.snackTitle, { flex: 1, paddingVertical: 8 }]}>{infoMsg}</Text>
         </View>
       )}
 
@@ -970,11 +1276,12 @@ const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: '#fff' },
   scrollContent: { paddingTop: 60, paddingHorizontal: 16, paddingBottom: 40 },
   header: { fontSize: 26, fontWeight: 'bold', marginBottom: 8 },
-  settingsLink: { color: '#2563eb', marginBottom: 16, lineHeight: 20 },
+  settingsLink: { color: '#2563eb', marginBottom: 12, lineHeight: 20 },
   editTitle: { fontSize: 14, fontWeight: 'bold', color: '#b45309', marginBottom: 8 },
-  row: { flexDirection: 'row', marginBottom: 12 },
+  row: { flexDirection: 'row', marginBottom: 8 },
   input: { flex: 1, borderWidth: 1, borderColor: '#ccc', borderRadius: 8, padding: 12, fontSize: 16 },
   addButton: { backgroundColor: '#2563eb', borderRadius: 8, paddingHorizontal: 16, justifyContent: 'center', marginLeft: 8 },
+  eventButton: { backgroundColor: '#4338CA' },
   addText: { color: '#fff', fontWeight: 'bold' },
   task: { flexDirection: 'row', alignItems: 'center', padding: 12, borderWidth: 1, borderColor: '#eee', borderRadius: 8, marginBottom: 8 },
   taskEditing: { borderColor: '#f59e0b', borderWidth: 2 },
@@ -983,18 +1290,22 @@ const styles = StyleSheet.create({
   deadlineOverdue: { color: '#b42318', fontWeight: 'bold' },
   doneButton: { backgroundColor: '#16a34a', borderRadius: 6, paddingVertical: 6, paddingHorizontal: 12, marginLeft: 8 },
   doneText: { color: '#fff' },
-  empty: { color: '#888', textAlign: 'center', marginTop: 40 },
   editActions: { flexDirection: 'row', marginBottom: 8 },
   deleteButton: { flex: 1, borderWidth: 1, borderColor: '#b42318', borderRadius: 8, padding: 12, alignItems: 'center', marginRight: 8 },
   deleteText: { color: '#b42318', fontWeight: 'bold' },
   cancelButton: { flex: 1, borderWidth: 1, borderColor: '#ccc', borderRadius: 8, padding: 12, alignItems: 'center' },
   cancelText: { color: '#333' },
+  eventRow: { flexDirection: 'row', alignItems: 'center', padding: 10, borderRadius: 8, backgroundColor: '#EEF2FF', marginBottom: 8 },
+  eventBadge: { backgroundColor: '#4338CA', borderRadius: 6, paddingVertical: 4, paddingHorizontal: 8, marginRight: 12, minWidth: 56, alignItems: 'center' },
+  eventBadgeText: { color: '#fff', fontWeight: 'bold', fontSize: 13 },
+  permissionButton: { padding: 12, alignItems: 'center', borderWidth: 1, borderColor: '#2563eb', borderStyle: 'dashed', borderRadius: 8, marginBottom: 8 },
+  halfTime: { flex: 1, marginRight: 8, marginBottom: 0 },
   snackbar: { position: 'absolute', left: 16, right: 16, bottom: 32, flexDirection: 'row', alignItems: 'center', backgroundColor: '#16181D', borderRadius: 12, paddingVertical: 10, paddingLeft: 16, paddingRight: 8 },
   snackTitle: { color: '#fff', fontWeight: 'bold' },
   snackSummary: { color: '#C9CCD4', fontSize: 13, marginTop: 2 },
   undoButton: { paddingVertical: 10, paddingHorizontal: 12 },
   undoText: { color: '#FDBA74', fontWeight: 'bold' },
-  section: { fontSize: 16, fontWeight: 'bold', marginTop: 16, marginBottom: 8 },
+  section: { fontSize: 16, fontWeight: 'bold', marginTop: 12, marginBottom: 8 },
   switchRow: { flexDirection: 'row', alignItems: 'center', marginTop: 24, marginBottom: 8 },
   hint: { color: '#555', marginBottom: 8 },
   timeRow: { flexDirection: 'row', alignItems: 'flex-start' },
