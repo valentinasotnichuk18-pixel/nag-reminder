@@ -41,6 +41,8 @@ Notifications.setNotificationHandler({
 const CHANNEL_ID = 'reminders';
 const CATEGORY_ID = 'task';
 const UNDO_SECONDS = 6;
+const SNOOZE_MIN = 15;
+const SNOOZE_PREFIX = 'snooze-';
 
 const INTERVALS = [
   { min: 15, label: '15 хв' },
@@ -56,6 +58,14 @@ const DEADLINE_DAYS = [
   { key: 'tomorrow', label: 'Завтра' },
   { key: 'pick', label: 'Обрати дату' },
 ];
+
+// Наростання наполегливості: заголовок залежить від порядку нагадування
+function nagTitle(order) {
+  if (order <= 1) return 'Нагадую';
+  if (order <= 3) return 'Знову нагадую';
+  if (order <= 6) return 'Я не відстану';
+  return 'Ну досить відкладати!';
+}
 
 // ---------- Дата і час ----------
 
@@ -105,14 +115,12 @@ function deadlineInfo(iso) {
   return { text: `${formatDate(d)} до ${time}`, overdue: false };
 }
 
-// Годинник або календар Android
 function openPicker({ value, mode, minimumDate, onPick }) {
   DateTimePickerAndroid.open({
     value,
     mode,
     is24Hour: true,
     minimumDate,
-    // Новий спосіб бібліотеки замість застарілого onChange
     onValueChange: (...args) => {
       const date = args.find((a) => a instanceof Date);
       if (date) onPick(date);
@@ -157,21 +165,23 @@ function intervalLabel(min) {
   return found ? found.label : `${min} хв`;
 }
 
-// ---------- Підсумок "Виконано за..." ----------
+// ---------- Розклад нагадувань ----------
 
+// Слоти нагадувань за добу. order: порядковий номер, рахуючи від часу створення
 function slotsFor(createdAtIso, s) {
   const created = new Date(createdAtIso);
   const base = created.getHours() * 60 + created.getMinutes();
   const slots = [];
   for (let m = base % s.intervalMin; m < 24 * 60; m += s.intervalMin) {
     if (m >= s.startMin && m <= s.endMin) {
-      slots.push({ hour: Math.floor(m / 60), minute: m % 60 });
+      const offset = (m - base + 1440) % 1440 || 1440;
+      slots.push({ hour: Math.floor(m / 60), minute: m % 60, offset });
     }
   }
-  return slots;
+  slots.sort((a, b) => a.offset - b.offset);
+  return slots.map((slot, i) => ({ ...slot, order: i + 1 }));
 }
 
-// Скільки нагадувань прийшло між створенням і виконанням
 function countReminders(createdIso, doneIso, s) {
   const created = new Date(createdIso);
   const done = new Date(doneIso);
@@ -227,6 +237,11 @@ async function setupNotifications() {
       buttonTitle: 'Готово',
       options: { opensAppToForeground: true },
     },
+    {
+      identifier: 'snooze',
+      buttonTitle: `Через ${SNOOZE_MIN} хв`,
+      options: { opensAppToForeground: true },
+    },
   ]);
   const { status } = await Notifications.requestPermissionsAsync();
   if (status !== 'granted') {
@@ -237,16 +252,22 @@ async function setupNotifications() {
   }
 }
 
+// Текст не залежить від "сьогодні/завтра", бо сповіщення повторюються щодня
 function notificationBody(task) {
-  const info = deadlineInfo(task.deadline);
-  if (!info) return task.title;
-  return info.overdue
-    ? `${task.title} · дедлайн прострочено!`
-    : `${task.title} · ${info.text}`;
+  if (!task.deadline) return task.title;
+  const d = new Date(task.deadline);
+  return `${task.title} · дедлайн ${formatDate(d)} о ${formatTime(d)}`;
 }
 
 async function doReschedule() {
-  await Notifications.cancelAllScheduledNotificationsAsync();
+  // Скасовуємо всі заплановані, крім відкладених "Через 15 хв"
+  const scheduled = await Notifications.getAllScheduledNotificationsAsync();
+  for (const n of scheduled) {
+    if (!n.identifier.startsWith(SNOOZE_PREFIX)) {
+      await Notifications.cancelScheduledNotificationAsync(n.identifier);
+    }
+  }
+
   const s = loadSettings();
   const active = db.getAllSync(
     "SELECT id, title, created_at, deadline FROM tasks WHERE status = 'active'"
@@ -255,7 +276,7 @@ async function doReschedule() {
     for (const slot of slotsFor(t.created_at, s)) {
       await Notifications.scheduleNotificationAsync({
         content: {
-          title: 'Нагадування',
+          title: nagTitle(slot.order),
           body: notificationBody(t),
           data: { taskId: t.id },
           categoryIdentifier: CATEGORY_ID,
@@ -286,7 +307,39 @@ async function dismissTaskNotifications(taskId) {
   }
 }
 
-// Повертає закрите завдання (для плашки) або null, якщо воно вже було закрите
+async function cancelSnooze(taskId) {
+  try {
+    await Notifications.cancelScheduledNotificationAsync(`${SNOOZE_PREFIX}${taskId}`);
+  } catch (e) {
+    // відкладеного нагадування не було, нічого страшного
+  }
+}
+
+async function snoozeTask(taskId) {
+  const t = db.getFirstSync(
+    "SELECT id, title, deadline FROM tasks WHERE id = ? AND status = 'active'",
+    taskId
+  );
+  await dismissTaskNotifications(taskId);
+  if (!t) return null;
+  await cancelSnooze(taskId);
+  await Notifications.scheduleNotificationAsync({
+    identifier: `${SNOOZE_PREFIX}${taskId}`,
+    content: {
+      title: 'Відпочила? Повертаюсь',
+      body: notificationBody(t),
+      data: { taskId: t.id },
+      categoryIdentifier: CATEGORY_ID,
+    },
+    trigger: {
+      type: Notifications.SchedulableTriggerInputTypes.TIME_INTERVAL,
+      seconds: SNOOZE_MIN * 60,
+      channelId: CHANNEL_ID,
+    },
+  });
+  return t;
+}
+
 async function completeTask(taskId) {
   const result = db.runSync(
     "UPDATE tasks SET status = 'done', done_at = ? WHERE id = ? AND status = 'active'",
@@ -294,6 +347,7 @@ async function completeTask(taskId) {
     taskId
   );
   await dismissTaskNotifications(taskId);
+  await cancelSnooze(taskId);
   await rescheduleAll();
   if (result.changes === 0) return null;
   return db.getFirstSync(
@@ -313,6 +367,7 @@ async function undoTask(taskId) {
 async function deleteTask(taskId) {
   db.runSync('DELETE FROM tasks WHERE id = ?', taskId);
   await dismissTaskNotifications(taskId);
+  await cancelSnooze(taskId);
   await rescheduleAll();
 }
 
@@ -326,7 +381,7 @@ async function sendTestNotification() {
   }
   await Notifications.scheduleNotificationAsync({
     content: {
-      title: 'Нагадування (тест)',
+      title: `${nagTitle(4)} (тест)`,
       body: notificationBody(t),
       data: { taskId: t.id },
       categoryIdentifier: CATEGORY_ID,
@@ -422,8 +477,9 @@ export default function App() {
   const [text, setText] = useState('');
   const [deadlineMode, setDeadlineMode] = useState('none');
   const [deadline, setDeadline] = useState(null);
-  const [editing, setEditing] = useState(null); // { id, originalDeadline }
-  const [lastDone, setLastDone] = useState(null); // { id, title, summary }
+  const [editing, setEditing] = useState(null);
+  const [lastDone, setLastDone] = useState(null);
+  const [snoozeInfo, setSnoozeInfo] = useState(null);
   const [tasks, setTasks] = useState(loadTasks);
   const [settings, setSettings] = useState(loadSettings);
 
@@ -434,12 +490,14 @@ export default function App() {
 
   useEffect(() => {
     const handleResponse = async (response) => {
-      if (response?.actionIdentifier === 'done') {
-        const taskId = response.notification.request.content.data?.taskId;
-        if (taskId) {
-          showDone(await completeTask(taskId));
-          setTasks(loadTasks());
-        }
+      const taskId = response?.notification.request.content.data?.taskId;
+      if (!taskId) return;
+      if (response.actionIdentifier === 'done') {
+        showDone(await completeTask(taskId));
+        setTasks(loadTasks());
+      } else if (response.actionIdentifier === 'snooze') {
+        const t = await snoozeTask(taskId);
+        if (t) setSnoozeInfo(`«${t.title}» нагадаю через ${SNOOZE_MIN} хв`);
       }
     };
 
@@ -449,12 +507,17 @@ export default function App() {
     return () => sub.remove();
   }, []);
 
-  // Плашка "Виконано" ховається сама через кілька секунд
   useEffect(() => {
     if (!lastDone) return undefined;
     const timer = setTimeout(() => setLastDone(null), UNDO_SECONDS * 1000);
     return () => clearTimeout(timer);
   }, [lastDone]);
+
+  useEffect(() => {
+    if (!snoozeInfo) return undefined;
+    const timer = setTimeout(() => setSnoozeInfo(null), 4000);
+    return () => clearTimeout(timer);
+  }, [snoozeInfo]);
 
   if (screen === 'settings') {
     return (
@@ -533,7 +596,6 @@ export default function App() {
     if (!title) return;
 
     const deadlineIso = deadline ? deadline.toISOString() : null;
-    // Не даємо поставити дедлайн у минулому (старий прострочений можна залишити)
     const deadlineChanged = !editing || deadlineIso !== editing.originalDeadline;
     if (deadline && deadline < new Date() && deadlineChanged) {
       Alert.alert('Цей час уже минув', 'Обери пізніший час або інший день.');
@@ -675,6 +737,12 @@ export default function App() {
           );
         }}
       />
+
+      {snoozeInfo && !lastDone && (
+        <View style={styles.snackbar}>
+          <Text style={[styles.snackTitle, { flex: 1, paddingVertical: 8 }]}>{snoozeInfo}</Text>
+        </View>
+      )}
 
       {lastDone && (
         <View style={styles.snackbar}>
