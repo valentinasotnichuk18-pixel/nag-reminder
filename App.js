@@ -5,6 +5,7 @@ import {
 } from 'react-native';
 import * as SQLite from 'expo-sqlite';
 import * as Notifications from 'expo-notifications';
+import { DateTimePickerAndroid } from '@react-native-community/datetimepicker';
 
 const db = SQLite.openDatabaseSync('tasks.db');
 
@@ -52,7 +53,47 @@ const DEADLINE_DAYS = [
   { key: 'none', label: 'Без дедлайну' },
   { key: 'today', label: 'Сьогодні' },
   { key: 'tomorrow', label: 'Завтра' },
+  { key: 'pick', label: 'Обрати дату' },
 ];
+
+// ---------- Дата і час ----------
+
+function pad(n) {
+  return String(n).padStart(2, '0');
+}
+
+function formatTime(d) {
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function formatDate(d) {
+  return `${pad(d.getDate())}.${pad(d.getMonth() + 1)}`;
+}
+
+// Хвилини від початку доби -> "07:30"
+function minutesLabel(total) {
+  return `${pad(Math.floor(total / 60))}:${pad(total % 60)}`;
+}
+
+function deadlineInfo(iso) {
+  if (!iso) return null;
+  const d = new Date(iso);
+  const now = new Date();
+  const time = formatTime(d);
+
+  if (d < now) return { text: 'прострочено', overdue: true };
+
+  const tomorrow = new Date(now);
+  tomorrow.setDate(now.getDate() + 1);
+
+  if (d.toDateString() === now.toDateString()) {
+    return { text: `до ${time}`, overdue: false };
+  }
+  if (d.toDateString() === tomorrow.toDateString()) {
+    return { text: `завтра до ${time}`, overdue: false };
+  }
+  return { text: `${formatDate(d)} до ${time}`, overdue: false };
+}
 
 // ---------- База ----------
 
@@ -70,10 +111,13 @@ function setSetting(key, value) {
 }
 
 function loadSettings() {
+  // Старі налаштування зберігались годинами, нові хвилинами від початку доби
+  const oldStart = getSetting('start_hour', 8) * 60;
+  const oldEnd = getSetting('end_hour', 22) * 60;
   return {
     intervalMin: getSetting('interval_min', 60),
-    startHour: getSetting('start_hour', 8),
-    endHour: getSetting('end_hour', 22),
+    startMin: getSetting('start_min', oldStart),
+    endMin: getSetting('end_min', oldEnd),
   };
 }
 
@@ -86,40 +130,6 @@ function loadTasks() {
 function intervalLabel(min) {
   const found = INTERVALS.find((i) => i.min === min);
   return found ? found.label : `${min} хв`;
-}
-
-// ---------- Дедлайн ----------
-
-function buildDeadline(dayKey, hour) {
-  if (dayKey === 'none') return null;
-  const d = new Date();
-  if (dayKey === 'tomorrow') d.setDate(d.getDate() + 1);
-  d.setHours(hour, 0, 0, 0);
-  return d;
-}
-
-function pad(n) {
-  return String(n).padStart(2, '0');
-}
-
-function deadlineInfo(iso) {
-  if (!iso) return null;
-  const d = new Date(iso);
-  const now = new Date();
-  const time = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
-
-  if (d < now) return { text: 'прострочено', overdue: true };
-
-  const tomorrow = new Date(now);
-  tomorrow.setDate(now.getDate() + 1);
-
-  if (d.toDateString() === now.toDateString()) {
-    return { text: `до ${time}`, overdue: false };
-  }
-  if (d.toDateString() === tomorrow.toDateString()) {
-    return { text: `завтра до ${time}`, overdue: false };
-  }
-  return { text: `${pad(d.getDate())}.${pad(d.getMonth() + 1)} до ${time}`, overdue: false };
 }
 
 // ---------- Сповіщення ----------
@@ -150,7 +160,7 @@ function slotsFor(createdAtIso, s) {
   const base = created.getHours() * 60 + created.getMinutes();
   const slots = [];
   for (let m = base % s.intervalMin; m < 24 * 60; m += s.intervalMin) {
-    if (m >= s.startHour * 60 && m <= s.endHour * 60) {
+    if (m >= s.startMin && m <= s.endMin) {
       slots.push({ hour: Math.floor(m / 60), minute: m % 60 });
     }
   }
@@ -242,35 +252,45 @@ async function sendTestNotification() {
 
 // ---------- Екрани ----------
 
-function HourStepper({ label, value, onChange }) {
+// Поле часу: натиснула, відкрився годинник Android з годинами і хвилинами
+function TimeField({ label, value, onChange }) {
+  const open = () => {
+    const d = new Date();
+    d.setHours(Math.floor(value / 60), value % 60, 0, 0);
+    DateTimePickerAndroid.open({
+      value: d,
+      mode: 'time',
+      is24Hour: true,
+      onChange: (event, date) => {
+        if (event.type !== 'set' || !date) return;
+        onChange(date.getHours() * 60 + date.getMinutes());
+      },
+    });
+  };
+
   return (
-    <View style={styles.stepperRow}>
-      <Text style={styles.stepperLabel}>{label}</Text>
-      <Pressable style={styles.stepBtn} onPress={() => onChange(Math.max(0, value - 1))}>
-        <Text style={styles.stepBtnText}>-</Text>
-      </Pressable>
-      <Text style={styles.stepValue}>{value}:00</Text>
-      <Pressable style={styles.stepBtn} onPress={() => onChange(Math.min(23, value + 1))}>
-        <Text style={styles.stepBtnText}>+</Text>
-      </Pressable>
-    </View>
+    <Pressable style={styles.timeButton} onPress={open}>
+      <Text style={styles.timeLabel}>{label}</Text>
+      <Text style={styles.timeValue}>{minutesLabel(value)}</Text>
+      <Text style={styles.timeChange}>Змінити</Text>
+    </Pressable>
   );
 }
 
 function SettingsScreen({ onBack }) {
   const initial = loadSettings();
   const [intervalMin, setIntervalMin] = useState(initial.intervalMin);
-  const [startHour, setStartHour] = useState(initial.startHour);
-  const [endHour, setEndHour] = useState(initial.endHour);
+  const [startMin, setStartMin] = useState(initial.startMin);
+  const [endMin, setEndMin] = useState(initial.endMin);
 
   const save = () => {
-    if (startHour >= endHour) {
+    if (startMin >= endMin) {
       Alert.alert('Помилка', 'Початок має бути раніше, ніж кінець');
       return;
     }
     setSetting('interval_min', intervalMin);
-    setSetting('start_hour', startHour);
-    setSetting('end_hour', endHour);
+    setSetting('start_min', startMin);
+    setSetting('end_min', endMin);
     onBack(true);
   };
 
@@ -294,8 +314,8 @@ function SettingsScreen({ onBack }) {
       </View>
 
       <Text style={styles.section}>Години нагадувань</Text>
-      <HourStepper label="З" value={startHour} onChange={setStartHour} />
-      <HourStepper label="До" value={endHour} onChange={setEndHour} />
+      <TimeField label="З" value={startMin} onChange={setStartMin} />
+      <TimeField label="До" value={endMin} onChange={setEndMin} />
 
       <Pressable style={styles.saveButton} onPress={save}>
         <Text style={styles.addText}>Зберегти</Text>
@@ -315,8 +335,8 @@ function SettingsScreen({ onBack }) {
 export default function App() {
   const [screen, setScreen] = useState('tasks');
   const [text, setText] = useState('');
-  const [deadlineDay, setDeadlineDay] = useState('none');
-  const [deadlineHour, setDeadlineHour] = useState(18);
+  const [deadlineMode, setDeadlineMode] = useState('none');
+  const [deadline, setDeadline] = useState(null);
   const [tasks, setTasks] = useState(loadTasks);
   const [settings, setSettings] = useState(loadSettings);
 
@@ -349,13 +369,60 @@ export default function App() {
     );
   }
 
+  // Час, який зберігаємо при зміні дня (за замовчуванням 18:00)
+  const keptHours = deadline ? deadline.getHours() : 18;
+  const keptMinutes = deadline ? deadline.getMinutes() : 0;
+
+  const chooseDay = (key) => {
+    if (key === 'none') {
+      setDeadlineMode('none');
+      setDeadline(null);
+      return;
+    }
+
+    if (key === 'pick') {
+      DateTimePickerAndroid.open({
+        value: deadline ?? new Date(),
+        mode: 'date',
+        minimumDate: new Date(),
+        onChange: (event, date) => {
+          if (event.type !== 'set' || !date) return;
+          const d = new Date(date);
+          d.setHours(keptHours, keptMinutes, 0, 0);
+          setDeadline(d);
+          setDeadlineMode('pick');
+        },
+      });
+      return;
+    }
+
+    const d = new Date();
+    if (key === 'tomorrow') d.setDate(d.getDate() + 1);
+    d.setHours(keptHours, keptMinutes, 0, 0);
+    setDeadline(d);
+    setDeadlineMode(key);
+  };
+
+  const pickTime = () => {
+    DateTimePickerAndroid.open({
+      value: deadline,
+      mode: 'time',
+      is24Hour: true,
+      onChange: (event, date) => {
+        if (event.type !== 'set' || !date) return;
+        const d = new Date(deadline);
+        d.setHours(date.getHours(), date.getMinutes(), 0, 0);
+        setDeadline(d);
+      },
+    });
+  };
+
   const addTask = () => {
     const title = text.trim();
     if (!title) return;
 
-    const deadline = buildDeadline(deadlineDay, deadlineHour);
     if (deadline && deadline < new Date()) {
-      Alert.alert('Цей час уже минув', 'Обери пізнішу годину або "Завтра".');
+      Alert.alert('Цей час уже минув', 'Обери пізніший час або інший день.');
       return;
     }
 
@@ -367,7 +434,8 @@ export default function App() {
     );
     setTasks(loadTasks());
     setText('');
-    setDeadlineDay('none');
+    setDeadlineMode('none');
+    setDeadline(null);
     Keyboard.dismiss();
     rescheduleAll();
   };
@@ -383,7 +451,7 @@ export default function App() {
 
       <Pressable onPress={() => setScreen('settings')}>
         <Text style={styles.settingsLink}>
-          Нагадування: кожні {intervalLabel(settings.intervalMin)}, з {settings.startHour}:00 до {settings.endHour}:00. Змінити
+          Нагадування: кожні {intervalLabel(settings.intervalMin)}, з {minutesLabel(settings.startMin)} до {minutesLabel(settings.endMin)}. Змінити
         </Text>
       </Pressable>
 
@@ -401,21 +469,27 @@ export default function App() {
       </View>
 
       <View style={styles.chips}>
-        {DEADLINE_DAYS.map((d) => (
-          <Pressable
-            key={d.key}
-            style={[styles.chip, deadlineDay === d.key && styles.chipActive]}
-            onPress={() => setDeadlineDay(d.key)}
-          >
-            <Text style={[styles.chipText, deadlineDay === d.key && styles.chipTextActive]}>
-              {d.label}
-            </Text>
-          </Pressable>
-        ))}
+        {DEADLINE_DAYS.map((d) => {
+          const active = deadlineMode === d.key;
+          const label = d.key === 'pick' && active && deadline ? formatDate(deadline) : d.label;
+          return (
+            <Pressable
+              key={d.key}
+              style={[styles.chip, active && styles.chipActive]}
+              onPress={() => chooseDay(d.key)}
+            >
+              <Text style={[styles.chipText, active && styles.chipTextActive]}>{label}</Text>
+            </Pressable>
+          );
+        })}
       </View>
 
-      {deadlineDay !== 'none' && (
-        <HourStepper label="До" value={deadlineHour} onChange={setDeadlineHour} />
+      {deadline && (
+        <Pressable style={styles.timeButton} onPress={pickTime}>
+          <Text style={styles.timeLabel}>Дедлайн о</Text>
+          <Text style={styles.timeValue}>{formatTime(deadline)}</Text>
+          <Text style={styles.timeChange}>Змінити час</Text>
+        </Pressable>
       )}
 
       <FlatList
@@ -468,11 +542,10 @@ const styles = StyleSheet.create({
   chipActive: { backgroundColor: '#2563eb' },
   chipText: { color: '#2563eb' },
   chipTextActive: { color: '#fff' },
-  stepperRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 8 },
-  stepperLabel: { width: 40, fontSize: 16 },
-  stepBtn: { width: 44, height: 44, borderRadius: 8, backgroundColor: '#e5e7eb', alignItems: 'center', justifyContent: 'center' },
-  stepBtnText: { fontSize: 22 },
-  stepValue: { width: 70, textAlign: 'center', fontSize: 18 },
+  timeButton: { flexDirection: 'row', alignItems: 'center', borderWidth: 1, borderColor: '#ccc', borderRadius: 8, padding: 12, marginBottom: 8 },
+  timeLabel: { fontSize: 15, color: '#555', minWidth: 40 },
+  timeValue: { fontSize: 20, fontWeight: 'bold', marginLeft: 8, flex: 1 },
+  timeChange: { color: '#2563eb' },
   saveButton: { backgroundColor: '#2563eb', borderRadius: 8, padding: 14, alignItems: 'center', marginTop: 24 },
   backButton: { padding: 14, alignItems: 'center' },
   backText: { color: '#666' },
