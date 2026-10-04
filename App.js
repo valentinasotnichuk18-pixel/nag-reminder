@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { StatusBar } from 'expo-status-bar';
 import {
   StyleSheet, Text, TextInput, Pressable, View, FlatList, Keyboard, Alert,
+  ScrollView, Switch,
 } from 'react-native';
 import * as SQLite from 'expo-sqlite';
 import * as Notifications from 'expo-notifications';
@@ -43,6 +44,8 @@ const CATEGORY_ID = 'task';
 const UNDO_SECONDS = 6;
 const SNOOZE_MIN = 15;
 const SNOOZE_PREFIX = 'snooze-';
+const MAX_SUMMARY_TIMES = 6;
+const MAX_SUMMARY_LINES = 8;
 
 const INTERVALS = [
   { min: 15, label: '15 хв' },
@@ -52,6 +55,12 @@ const INTERVALS = [
   { min: 180, label: '3 год' },
 ];
 
+const SUMMARY_INTERVALS = [
+  { min: 120, label: '2 год' },
+  { min: 180, label: '3 год' },
+  { min: 240, label: '4 год' },
+];
+
 const DEADLINE_DAYS = [
   { key: 'none', label: 'Без дедлайну' },
   { key: 'today', label: 'Сьогодні' },
@@ -59,7 +68,6 @@ const DEADLINE_DAYS = [
   { key: 'pick', label: 'Обрати дату' },
 ];
 
-// Наростання наполегливості: заголовок залежить від порядку нагадування
 function nagTitle(order) {
   if (order <= 1) return 'Нагадую';
   if (order <= 3) return 'Знову нагадую';
@@ -136,12 +144,25 @@ function getSetting(key, defaultValue) {
   return row ? Number(row.value) : defaultValue;
 }
 
+function getSettingText(key, defaultValue) {
+  const row = db.getFirstSync('SELECT value FROM settings WHERE key = ?', key);
+  return row ? row.value : defaultValue;
+}
+
 function setSetting(key, value) {
   db.runSync(
     'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
     key,
     String(value)
   );
+}
+
+function parseTimes(text) {
+  return text
+    .split(',')
+    .filter(Boolean)
+    .map(Number)
+    .filter((n) => !Number.isNaN(n));
 }
 
 function loadSettings() {
@@ -151,6 +172,10 @@ function loadSettings() {
     intervalMin: getSetting('interval_min', 60),
     startMin: getSetting('start_min', oldStart),
     endMin: getSetting('end_min', oldEnd),
+    summaryEnabled: getSetting('summary_enabled', 1) === 1,
+    summaryMode: getSettingText('summary_mode', 'interval'),
+    summaryIntervalMin: getSetting('summary_interval', 180),
+    summaryTimes: parseTimes(getSettingText('summary_times', '540,780,1080')),
   };
 }
 
@@ -167,7 +192,6 @@ function intervalLabel(min) {
 
 // ---------- Розклад нагадувань ----------
 
-// Слоти нагадувань за добу. order: порядковий номер, рахуючи від часу створення
 function slotsFor(createdAtIso, s) {
   const created = new Date(createdAtIso);
   const base = created.getHours() * 60 + created.getMinutes();
@@ -224,6 +248,58 @@ function doneSummary(task) {
   return `за ${duration}, після ${count} ${remindersWord(count)}`;
 }
 
+// ---------- Зведення ----------
+
+// Коли надсилати зведення (хвилини від початку доби)
+function summarySlots(s) {
+  if (!s.summaryEnabled) return [];
+  if (s.summaryMode === 'times') {
+    return [...new Set(s.summaryTimes)].sort((a, b) => a - b);
+  }
+  const slots = [];
+  for (let m = s.startMin; m <= s.endMin; m += s.summaryIntervalMin) slots.push(m);
+  return slots;
+}
+
+function summaryLabel(s) {
+  if (!s.summaryEnabled) return 'вимкнено';
+  if (s.summaryMode === 'times') {
+    return `о ${summarySlots(s).map(minutesLabel).join(', ')}`;
+  }
+  return `кожні ${s.summaryIntervalMin / 60} год`;
+}
+
+function tasksWord(n) {
+  const last = n % 10;
+  const lastTwo = n % 100;
+  if (last === 1 && lastTwo !== 11) return 'справа чекає';
+  if (last >= 2 && last <= 4 && (lastTwo < 12 || lastTwo > 14)) return 'справи чекають';
+  return 'справ чекають';
+}
+
+function loadSummaryTasks() {
+  // Спочатку з найближчим дедлайном, потім без дедлайну
+  return db.getAllSync(
+    "SELECT title, deadline FROM tasks WHERE status = 'active' ORDER BY deadline IS NULL, deadline, id"
+  );
+}
+
+function summaryContent(list) {
+  const lines = list.slice(0, MAX_SUMMARY_LINES).map((t, i) => {
+    if (!t.deadline) return `${i + 1}. ${t.title}`;
+    const d = new Date(t.deadline);
+    return `${i + 1}. ${t.title} · до ${formatDate(d)} ${formatTime(d)}`;
+  });
+  if (list.length > MAX_SUMMARY_LINES) {
+    lines.push(`і ще ${list.length - MAX_SUMMARY_LINES}`);
+  }
+  return {
+    title: `${list.length} ${tasksWord(list.length)}`,
+    body: lines.join('\n'),
+    data: { type: 'summary' },
+  };
+}
+
 // ---------- Сповіщення ----------
 
 async function setupNotifications() {
@@ -252,7 +328,6 @@ async function setupNotifications() {
   }
 }
 
-// Текст не залежить від "сьогодні/завтра", бо сповіщення повторюються щодня
 function notificationBody(task) {
   if (!task.deadline) return task.title;
   const d = new Date(task.deadline);
@@ -260,7 +335,6 @@ function notificationBody(task) {
 }
 
 async function doReschedule() {
-  // Скасовуємо всі заплановані, крім відкладених "Через 15 хв"
   const scheduled = await Notifications.getAllScheduledNotificationsAsync();
   for (const n of scheduled) {
     if (!n.identifier.startsWith(SNOOZE_PREFIX)) {
@@ -272,6 +346,8 @@ async function doReschedule() {
   const active = db.getAllSync(
     "SELECT id, title, created_at, deadline FROM tasks WHERE status = 'active'"
   );
+
+  // Нагадування про кожне завдання
   for (const t of active) {
     for (const slot of slotsFor(t.created_at, s)) {
       await Notifications.scheduleNotificationAsync({
@@ -285,6 +361,22 @@ async function doReschedule() {
           type: Notifications.SchedulableTriggerInputTypes.DAILY,
           hour: slot.hour,
           minute: slot.minute,
+          channelId: CHANNEL_ID,
+        },
+      });
+    }
+  }
+
+  // Зведення (тільки якщо є активні завдання)
+  if (active.length > 0) {
+    const content = summaryContent(loadSummaryTasks());
+    for (const m of summarySlots(s)) {
+      await Notifications.scheduleNotificationAsync({
+        content,
+        trigger: {
+          type: Notifications.SchedulableTriggerInputTypes.DAILY,
+          hour: Math.floor(m / 60),
+          minute: m % 60,
           channelId: CHANNEL_ID,
         },
       });
@@ -395,6 +487,24 @@ async function sendTestNotification() {
   Alert.alert('Тест', 'Згорни застосунок, сповіщення прийде через 10 секунд.');
 }
 
+async function sendTestSummary() {
+  const list = loadSummaryTasks();
+  if (list.length === 0) {
+    Alert.alert('Немає завдань', 'Зведення приходить, тільки коли є активні завдання.');
+    return;
+  }
+  const content = summaryContent(list);
+  await Notifications.scheduleNotificationAsync({
+    content: { ...content, title: `${content.title} (тест)` },
+    trigger: {
+      type: Notifications.SchedulableTriggerInputTypes.TIME_INTERVAL,
+      seconds: 10,
+      channelId: CHANNEL_ID,
+    },
+  });
+  Alert.alert('Тест', 'Згорни застосунок, зведення прийде через 10 секунд.');
+}
+
 // ---------- Екрани ----------
 
 function TimeField({ label, value, onChange }) {
@@ -409,11 +519,29 @@ function TimeField({ label, value, onChange }) {
   };
 
   return (
-    <Pressable style={styles.timeButton} onPress={open}>
+    <Pressable style={[styles.timeButton, { flex: 1 }]} onPress={open}>
       <Text style={styles.timeLabel}>{label}</Text>
       <Text style={styles.timeValue}>{minutesLabel(value)}</Text>
       <Text style={styles.timeChange}>Змінити</Text>
     </Pressable>
+  );
+}
+
+function Chips({ items, value, onChange }) {
+  return (
+    <View style={styles.chips}>
+      {items.map((i) => (
+        <Pressable
+          key={i.key}
+          style={[styles.chip, value === i.key && styles.chipActive]}
+          onPress={() => onChange(i.key)}
+        >
+          <Text style={[styles.chipText, value === i.key && styles.chipTextActive]}>
+            {i.label}
+          </Text>
+        </Pressable>
+      ))}
+    </View>
   );
 }
 
@@ -422,40 +550,113 @@ function SettingsScreen({ onBack }) {
   const [intervalMin, setIntervalMin] = useState(initial.intervalMin);
   const [startMin, setStartMin] = useState(initial.startMin);
   const [endMin, setEndMin] = useState(initial.endMin);
+  const [summaryEnabled, setSummaryEnabled] = useState(initial.summaryEnabled);
+  const [summaryMode, setSummaryMode] = useState(initial.summaryMode);
+  const [summaryIntervalMin, setSummaryIntervalMin] = useState(initial.summaryIntervalMin);
+  const [summaryTimes, setSummaryTimes] = useState(initial.summaryTimes);
+
+  const updateTime = (index, value) => {
+    setSummaryTimes(summaryTimes.map((t, i) => (i === index ? value : t)));
+  };
+
+  const removeTime = (index) => {
+    setSummaryTimes(summaryTimes.filter((_, i) => i !== index));
+  };
+
+  const addTime = () => {
+    const last = summaryTimes.length ? Math.max(...summaryTimes) : 540;
+    setSummaryTimes([...summaryTimes, Math.min(last + 180, 23 * 60)]);
+  };
 
   const save = () => {
     if (startMin >= endMin) {
       Alert.alert('Помилка', 'Початок має бути раніше, ніж кінець');
       return;
     }
+    if (summaryEnabled && summaryMode === 'times' && summaryTimes.length === 0) {
+      Alert.alert('Помилка', 'Додай хоча б один час для зведення');
+      return;
+    }
+    const cleanTimes = [...new Set(summaryTimes)].sort((a, b) => a - b);
     setSetting('interval_min', intervalMin);
     setSetting('start_min', startMin);
     setSetting('end_min', endMin);
+    setSetting('summary_enabled', summaryEnabled ? 1 : 0);
+    setSetting('summary_mode', summaryMode);
+    setSetting('summary_interval', summaryIntervalMin);
+    setSetting('summary_times', cleanTimes.join(','));
     onBack(true);
   };
 
   return (
-    <View style={styles.container}>
+    <ScrollView style={styles.screen} contentContainerStyle={styles.scrollContent}>
       <Text style={styles.header}>Налаштування</Text>
 
       <Text style={styles.section}>Нагадувати кожні</Text>
-      <View style={styles.chips}>
-        {INTERVALS.map((i) => (
-          <Pressable
-            key={i.min}
-            style={[styles.chip, intervalMin === i.min && styles.chipActive]}
-            onPress={() => setIntervalMin(i.min)}
-          >
-            <Text style={[styles.chipText, intervalMin === i.min && styles.chipTextActive]}>
-              {i.label}
-            </Text>
-          </Pressable>
-        ))}
-      </View>
+      <Chips
+        items={INTERVALS.map((i) => ({ key: i.min, label: i.label }))}
+        value={intervalMin}
+        onChange={setIntervalMin}
+      />
 
       <Text style={styles.section}>Години нагадувань</Text>
       <TimeField label="З" value={startMin} onChange={setStartMin} />
       <TimeField label="До" value={endMin} onChange={setEndMin} />
+
+      <View style={styles.switchRow}>
+        <Text style={[styles.section, { flex: 1, marginTop: 0, marginBottom: 0 }]}>
+          Зведення всіх справ
+        </Text>
+        <Switch value={summaryEnabled} onValueChange={setSummaryEnabled} />
+      </View>
+
+      {summaryEnabled && (
+        <View>
+          <Chips
+            items={[
+              { key: 'interval', label: 'Кожні N годин' },
+              { key: 'times', label: 'У конкретний час' },
+            ]}
+            value={summaryMode}
+            onChange={setSummaryMode}
+          />
+
+          {summaryMode === 'interval' && (
+            <View>
+              <Text style={styles.hint}>
+                Від {minutesLabel(startMin)} до {minutesLabel(endMin)}, кожні:
+              </Text>
+              <Chips
+                items={SUMMARY_INTERVALS.map((i) => ({ key: i.min, label: i.label }))}
+                value={summaryIntervalMin}
+                onChange={setSummaryIntervalMin}
+              />
+            </View>
+          )}
+
+          {summaryMode === 'times' && (
+            <View>
+              {summaryTimes.map((t, i) => (
+                <View key={i} style={styles.timeRow}>
+                  <TimeField label={`${i + 1}.`} value={t} onChange={(v) => updateTime(i, v)} />
+                  <Pressable
+                    style={styles.removeButton}
+                    onPress={() => removeTime(i)}
+                    accessibilityLabel="Прибрати час"
+                  >
+                    <Text style={styles.removeText}>✕</Text>
+                  </Pressable>
+                </View>
+              ))}
+              {summaryTimes.length < MAX_SUMMARY_TIMES && (
+                <Pressable style={styles.addTimeButton} onPress={addTime}>
+                  <Text style={styles.timeChange}>+ Додати час</Text>
+                </Pressable>
+              )}
+            </View>
+          )}
+        </View>
+      )}
 
       <Pressable style={styles.saveButton} onPress={save}>
         <Text style={styles.addText}>Зберегти</Text>
@@ -465,10 +666,13 @@ function SettingsScreen({ onBack }) {
       </Pressable>
 
       <Pressable style={styles.testButton} onPress={sendTestNotification}>
-        <Text style={styles.testText}>Тест: сповіщення через 10 секунд</Text>
+        <Text style={styles.testText}>Тест: нагадування через 10 секунд</Text>
+      </Pressable>
+      <Pressable style={styles.testButton} onPress={sendTestSummary}>
+        <Text style={styles.testText}>Тест: зведення через 10 секунд</Text>
       </Pressable>
       <StatusBar style="dark" />
-    </View>
+    </ScrollView>
   );
 }
 
@@ -657,7 +861,8 @@ export default function App() {
 
       <Pressable onPress={() => setScreen('settings')}>
         <Text style={styles.settingsLink}>
-          Нагадування: кожні {intervalLabel(settings.intervalMin)}, з {minutesLabel(settings.startMin)} до {minutesLabel(settings.endMin)}. Змінити
+          Нагадування: кожні {intervalLabel(settings.intervalMin)}, з {minutesLabel(settings.startMin)} до {minutesLabel(settings.endMin)}.
+          {'\n'}Зведення: {summaryLabel(settings)}. Змінити
         </Text>
       </Pressable>
 
@@ -762,8 +967,10 @@ export default function App() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#fff', paddingTop: 60, paddingHorizontal: 16 },
+  screen: { flex: 1, backgroundColor: '#fff' },
+  scrollContent: { paddingTop: 60, paddingHorizontal: 16, paddingBottom: 40 },
   header: { fontSize: 26, fontWeight: 'bold', marginBottom: 8 },
-  settingsLink: { color: '#2563eb', marginBottom: 16 },
+  settingsLink: { color: '#2563eb', marginBottom: 16, lineHeight: 20 },
   editTitle: { fontSize: 14, fontWeight: 'bold', color: '#b45309', marginBottom: 8 },
   row: { flexDirection: 'row', marginBottom: 12 },
   input: { flex: 1, borderWidth: 1, borderColor: '#ccc', borderRadius: 8, padding: 12, fontSize: 16 },
@@ -788,6 +995,12 @@ const styles = StyleSheet.create({
   undoButton: { paddingVertical: 10, paddingHorizontal: 12 },
   undoText: { color: '#FDBA74', fontWeight: 'bold' },
   section: { fontSize: 16, fontWeight: 'bold', marginTop: 16, marginBottom: 8 },
+  switchRow: { flexDirection: 'row', alignItems: 'center', marginTop: 24, marginBottom: 8 },
+  hint: { color: '#555', marginBottom: 8 },
+  timeRow: { flexDirection: 'row', alignItems: 'flex-start' },
+  removeButton: { width: 48, height: 52, alignItems: 'center', justifyContent: 'center', marginLeft: 4 },
+  removeText: { fontSize: 18, color: '#b42318' },
+  addTimeButton: { padding: 12, alignItems: 'center', borderWidth: 1, borderColor: '#2563eb', borderStyle: 'dashed', borderRadius: 8 },
   chips: { flexDirection: 'row', flexWrap: 'wrap' },
   chip: { borderWidth: 1, borderColor: '#2563eb', borderRadius: 20, paddingVertical: 8, paddingHorizontal: 14, marginRight: 8, marginBottom: 8 },
   chipActive: { backgroundColor: '#2563eb' },
@@ -800,6 +1013,6 @@ const styles = StyleSheet.create({
   saveButton: { backgroundColor: '#2563eb', borderRadius: 8, padding: 14, alignItems: 'center', marginTop: 24 },
   backButton: { padding: 14, alignItems: 'center' },
   backText: { color: '#666' },
-  testButton: { borderWidth: 1, borderColor: '#f59e0b', borderRadius: 8, padding: 14, alignItems: 'center', marginTop: 32 },
+  testButton: { borderWidth: 1, borderColor: '#f59e0b', borderRadius: 8, padding: 14, alignItems: 'center', marginTop: 12 },
   testText: { color: '#b45309' },
 });
