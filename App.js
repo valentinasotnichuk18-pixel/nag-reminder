@@ -6,7 +6,8 @@ import {
 } from 'react-native';
 import * as SQLite from 'expo-sqlite';
 import * as Notifications from 'expo-notifications';
-import * as Calendar from 'expo-calendar/legacy';
+import * as Calendar from 'expo-calendar';
+import { ExpoCalendarEvent } from 'expo-calendar';
 import { DateTimePickerAndroid } from '@react-native-community/datetimepicker';
 import Svg, { Path, Circle } from 'react-native-svg';
 import {
@@ -124,7 +125,7 @@ const DEADLINE_DAYS = [
   { key: 'none', label: 'Без дедлайну' },
   { key: 'today', label: 'Сьогодні' },
   { key: 'tomorrow', label: 'Завтра' },
-  { key: 'pick', label: 'Дата…' },
+  { key: 'pick', label: 'Інша дата' },
 ];
 
 const EVENT_DAYS = DEADLINE_DAYS.filter((d) => d.key !== 'none');
@@ -298,24 +299,51 @@ function intervalLabel(min) {
 
 // ---------- Календар ----------
 
+// Новий об'єктний API expo-calendar (SDK 57). Усі звернення до календаря тут,
+// щоб решта коду не залежала від бібліотеки.
+
 async function hasCalendarPermission(ask) {
-  const { status } = ask
-    ? await Calendar.requestCalendarPermissionsAsync()
-    : await Calendar.getCalendarPermissionsAsync();
-  return status === 'granted';
+  const result = ask
+    ? await Calendar.requestCalendarPermissions()
+    : await Calendar.getCalendarPermissions();
+  return result?.granted === true || result?.status === 'granted';
 }
 
 async function getMainCalendar() {
-  const calendars = await Calendar.getCalendarsAsync(Calendar.EntityTypes.EVENT);
+  const calendars = await Calendar.getCalendars(Calendar.EntityTypes.EVENT);
   const writable = calendars.filter((c) => c.allowsModifications);
-  const owner = Calendar.CalendarAccessLevel.OWNER;
+  const isOwner = (c) => String(c.accessLevel).toLowerCase() === 'owner';
   return (
     writable.find((c) => c.isPrimary) ||
-    writable.find((c) => c.source?.type === 'com.google' && c.accessLevel === owner) ||
-    writable.find((c) => c.accessLevel === owner) ||
+    writable.find((c) => c.source?.type === 'com.google' && isOwner(c)) ||
+    writable.find(isOwner) ||
     writable[0] ||
     null
   );
+}
+
+async function createCalendarEvent(calendar, details) {
+  const event = await calendar.createEvent(details);
+  return String(event.id);
+}
+
+async function updateCalendarEvent(eventId, details) {
+  const event = await ExpoCalendarEvent.get(eventId);
+  await event.update(details);
+}
+
+async function deleteCalendarEvent(eventId) {
+  const event = await ExpoCalendarEvent.get(eventId);
+  await event.delete();
+}
+
+// null, якщо події вже немає в календарі
+async function getCalendarEvent(eventId) {
+  try {
+    return await ExpoCalendarEvent.get(eventId);
+  } catch (e) {
+    return null;
+  }
 }
 
 async function loadEvents(from, to, ask = false) {
@@ -323,7 +351,7 @@ async function loadEvents(from, to, ask = false) {
     if (!(await hasCalendarPermission(ask))) return null;
     const calendar = await getMainCalendar();
     if (!calendar) return [];
-    const events = await Calendar.getEventsAsync([calendar.id], from, to);
+    const events = await Calendar.listEvents([calendar], from, to);
     return events
       .map((e) => {
         const start = new Date(e.startDate);
@@ -394,12 +422,7 @@ async function syncOwnEvents() {
       addDays(new Date(), -1).toISOString()
     );
     for (const r of rows) {
-      let ev = null;
-      try {
-        ev = await Calendar.getEventAsync(r.calendar_event_id);
-      } catch (e) {
-        ev = null;
-      }
+      const ev = await getCalendarEvent(r.calendar_event_id);
       if (!ev) {
         db.runSync("UPDATE events SET status = 'deleted' WHERE id = ?", r.id);
       } else {
@@ -604,67 +627,147 @@ function notificationBody(task) {
   return `${task.title} · дедлайн ${formatDate(d)} о ${formatTime(d)}`;
 }
 
+// Android тримає до 500 запланованих сповіщень на застосунок. Залишаємо запас.
+const MAX_SCHEDULED = 450;
+const MAX_OVERFLOW_LINES = 8;
+
+async function scheduleDaily(content, hour, minute) {
+  await Notifications.scheduleNotificationAsync({
+    content: { ...content, color: C.green },
+    trigger: {
+      type: Notifications.SchedulableTriggerInputTypes.DAILY,
+      hour,
+      minute,
+      channelId: CHANNEL_ID,
+    },
+  });
+}
+
+// Слоти спільного нагадування для завдань, які не влізли в ліміт
+function gridSlots(s) {
+  const slots = [];
+  for (let m = s.startMin; m <= s.endMin; m += s.intervalMin) slots.push(m);
+  return slots;
+}
+
 async function doReschedule() {
   const scheduled = await Notifications.getAllScheduledNotificationsAsync();
+  let snoozedCount = 0;
   for (const n of scheduled) {
-    if (!n.identifier.startsWith(SNOOZE_PREFIX)) {
+    if (n.identifier.startsWith(SNOOZE_PREFIX)) {
+      snoozedCount += 1;
+    } else {
       await Notifications.cancelScheduledNotificationAsync(n.identifier);
     }
   }
 
   const s = loadSettings();
-  const active = db.getAllSync(
-    "SELECT id, title, created_at, deadline FROM tasks WHERE status = 'active'"
-  );
-
-  for (const t of active) {
-    for (const slot of slotsFor(t.created_at, s)) {
-      await Notifications.scheduleNotificationAsync({
-        content: {
-          title: nagTitle(slot.order),
-          body: notificationBody(t),
-          data: { taskId: t.id },
-          categoryIdentifier: CATEGORY_ID,
-          color: C.green,
-        },
-        trigger: {
-          type: Notifications.SchedulableTriggerInputTypes.DAILY,
-          hour: slot.hour,
-          minute: slot.minute,
-          channelId: CHANNEL_ID,
-        },
-      });
-    }
-  }
-
-  const slots = summarySlots(s);
-  if (slots.length === 0) return;
-
   const now = new Date();
-  const events =
-    (await loadEvents(now, endOfDay(addDays(now, SUMMARY_DAYS_AHEAD - 1)), false)) || [];
-  const taskList = loadSummaryTasks();
 
-  for (let day = 0; day < SUMMARY_DAYS_AHEAD; day += 1) {
-    const date = startOfDay(addDays(now, day));
-    for (const m of slots) {
-      const time = new Date(date);
-      time.setHours(Math.floor(m / 60), m % 60, 0, 0);
-      if (time <= now) continue;
-
-      const dayEvents = eventsForSummaryAt(time, events);
-      if (taskList.length === 0 && dayEvents.length === 0) continue;
-
-      await Notifications.scheduleNotificationAsync({
-        content: { ...summaryContent(taskList, dayEvents), color: C.green },
-        trigger: {
-          type: Notifications.SchedulableTriggerInputTypes.DATE,
-          date: time,
-          channelId: CHANNEL_ID,
-        },
-      });
+  // 1. Зведення: окремо на кожен день, з подіями саме цього дня
+  const summaries = [];
+  const sSlots = summarySlots(s);
+  if (sSlots.length > 0) {
+    const events =
+      (await loadEvents(now, endOfDay(addDays(now, SUMMARY_DAYS_AHEAD - 1)), false)) || [];
+    const taskList = loadSummaryTasks();
+    for (let day = 0; day < SUMMARY_DAYS_AHEAD; day += 1) {
+      const date = startOfDay(addDays(now, day));
+      for (const m of sSlots) {
+        const time = new Date(date);
+        time.setHours(Math.floor(m / 60), m % 60, 0, 0);
+        if (time <= now) continue;
+        const dayEvents = eventsForSummaryAt(time, events);
+        if (taskList.length === 0 && dayEvents.length === 0) continue;
+        summaries.push({ time, content: summaryContent(taskList, dayEvents) });
+      }
     }
   }
+
+  // 2. Завдання: найтерміновіші першими (найближчий дедлайн, потім найстаріші)
+  const active = db.getAllSync(
+    "SELECT id, title, created_at, deadline FROM tasks WHERE status = 'active' ORDER BY deadline IS NULL, deadline, created_at"
+  );
+  const plans = active.map((t) => ({ task: t, slots: slotsFor(t.created_at, s) }));
+  const totalTaskSlots = plans.reduce((sum, p) => sum + p.slots.length, 0);
+
+  let budget = MAX_SCHEDULED - snoozedCount - summaries.length;
+  const overflowSlots = gridSlots(s);
+  const fitsAll = totalTaskSlots <= budget;
+  if (!fitsAll) budget -= overflowSlots.length;
+
+  const individual = [];
+  const overflow = [];
+  for (const p of plans) {
+    if (fitsAll || p.slots.length <= budget) {
+      individual.push(p);
+      budget -= p.slots.length;
+    } else {
+      overflow.push(p.task);
+    }
+  }
+
+  // 3. Плануємо: окремі нагадування з кнопками
+  for (const { task, slots } of individual) {
+    for (const slot of slots) {
+      await scheduleDaily(
+        {
+          title: nagTitle(slot.order),
+          body: notificationBody(task),
+          data: { taskId: task.id },
+          categoryIdentifier: CATEGORY_ID,
+        },
+        slot.hour,
+        slot.minute
+      );
+    }
+  }
+
+  // Спільне нагадування для решти завдань
+  if (overflow.length > 0) {
+    const lines = overflow.slice(0, MAX_OVERFLOW_LINES).map((t) => `• ${t.title}`);
+    if (overflow.length > MAX_OVERFLOW_LINES) {
+      lines.push(`і ще ${overflow.length - MAX_OVERFLOW_LINES}`);
+    }
+    for (const m of overflowSlots) {
+      await scheduleDaily(
+        {
+          title: `Тук-тук! Ще ${overflow.length} ${tasksWord(overflow.length)}`,
+          body: lines.join('\n'),
+          data: { type: 'overflow' },
+        },
+        Math.floor(m / 60),
+        m % 60
+      );
+    }
+  }
+
+  for (const { time, content } of summaries) {
+    await Notifications.scheduleNotificationAsync({
+      content: { ...content, color: C.green },
+      trigger: {
+        type: Notifications.SchedulableTriggerInputTypes.DATE,
+        date: time,
+        channelId: CHANNEL_ID,
+      },
+    });
+  }
+}
+
+
+// Для тестування ліміту: скільки сповіщень зараз у розкладі Android
+async function showScheduledCount() {
+  await rescheduleChain;
+  const all = await Notifications.getAllScheduledNotificationsAsync();
+  const count = (type) => all.filter((n) => n.content.data?.type === type).length;
+  const tasksCount = all.filter((n) => n.content.data?.taskId).length;
+  Alert.alert(
+    'Заплановані сповіщення',
+    `Усього: ${all.length} з ${MAX_SCHEDULED} можливих\n` +
+      `Нагадування про завдання: ${tasksCount}\n` +
+      `Спільні "Ще N справ": ${count('overflow')}\n` +
+      `Зведення: ${count('summary')}`
+  );
 }
 
 let rescheduleChain = Promise.resolve();
@@ -857,6 +960,33 @@ function HistoryIcon({ size = 22, color = C.ink }) {
       <Path d="M3 12a9 9 0 1 0 3-6.7L3 8" fill="none" stroke={color} strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" />
       <Path d="M3 3v5h5M12 7v5l3 2" fill="none" stroke={color} strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" />
     </Svg>
+  );
+}
+
+function ClockIcon({ size = 16, color = C.greenDark }) {
+  return (
+    <Svg width={size} height={size} viewBox="0 0 24 24">
+      <Circle cx={12} cy={12} r={9} fill="none" stroke={color} strokeWidth={2.2} />
+      <Path d="M12 7v5l3 2" fill="none" stroke={color} strokeWidth={2.2} strokeLinecap="round" strokeLinejoin="round" />
+    </Svg>
+  );
+}
+
+const WEEKDAYS_SHORT = ['нд', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб'];
+
+// "вт 07.10"
+function shortDate(d) {
+  return `${WEEKDAYS_SHORT[d.getDay()]} ${formatDate(d)}`;
+}
+
+// Компактна кнопка зі значенням: дата або час
+function ValuePill({ icon, text, onPress, label }) {
+  return (
+    <Pressable style={styles.valuePill} onPress={onPress} accessibilityLabel={label} hitSlop={6}>
+      {icon === 'calendar' && <CalendarIcon size={16} color={C.greenDark} />}
+      {icon === 'clock' && <ClockIcon />}
+      <Text style={styles.valuePillText}>{text}</Text>
+    </Pressable>
   );
 }
 
@@ -1108,6 +1238,9 @@ function SettingsScreen({ onBack, onHelp }) {
         </Pressable>
         <Pressable style={styles.testButton} onPress={sendTestSummary}>
           <Text style={styles.testText}>Зведення через 10 секунд</Text>
+        </Pressable>
+        <Pressable style={styles.testButton} onPress={showScheduledCount}>
+          <Text style={styles.testText}>Скільки сповіщень заплановано</Text>
         </Pressable>
       </View>
       <StatusBar style="dark" />
@@ -1681,7 +1814,7 @@ export default function App() {
       };
 
       if (isEditingEvent) {
-        await Calendar.updateEventAsync(editing.calendarEventId, details);
+        await updateCalendarEvent(editing.calendarEventId, details);
         db.runSync(
           'UPDATE events SET title = ?, start_at = ?, end_at = ?, reminder_min = ? WHERE id = ?',
           title,
@@ -1700,7 +1833,7 @@ export default function App() {
           );
           return;
         }
-        const calendarEventId = await Calendar.createEventAsync(calendar.id, details);
+        const calendarEventId = await createCalendarEvent(calendar, details);
         db.runSync(
           'INSERT INTO events (calendar_event_id, title, start_at, end_at, reminder_min, created_at) VALUES (?, ?, ?, ?, ?, ?)',
           String(calendarEventId),
@@ -1733,7 +1866,7 @@ export default function App() {
         style: 'destructive',
         onPress: async () => {
           try {
-            await Calendar.deleteEventAsync(calendarEventId);
+            await deleteCalendarEvent(calendarEventId);
           } catch (e) {
             // у календарі її вже немає, нічого страшного
           }
@@ -1849,40 +1982,33 @@ export default function App() {
           <View>
             <Chips
               variant="soft"
-              items={DEADLINE_DAYS.map((d) => ({
-                key: d.key,
-                label:
-                  d.key === deadlineMode && deadline
-                    ? `${d.key === 'pick' ? formatDate(deadline) : d.label} · ${formatTime(deadline)}`
-                    : d.label,
-              }))}
+              items={DEADLINE_DAYS}
               value={deadlineMode}
-              onChange={(key) => (key === deadlineMode && deadline && key !== 'pick' ? pickTime() : chooseDay(key))}
+              onChange={(key) => (key === deadlineMode && deadline ? pickTime() : chooseDay(key))}
             />
             {deadline && (
-              <Pressable onPress={pickTime}>
-                <Text style={styles.linkSmall}>Змінити час дедлайну</Text>
-              </Pressable>
+              <View style={styles.valueRow}>
+                <Text style={styles.valueLabel}>Дедлайн</Text>
+                <ValuePill icon="calendar" text={shortDate(deadline)} onPress={() => chooseDay('pick')} label="Змінити дату дедлайну" />
+                <ValuePill icon="clock" text={formatTime(deadline)} onPress={pickTime} label="Змінити час дедлайну" />
+              </View>
             )}
           </View>
         )}
 
         {isEvent && (
           <View>
-            <Chips
-              variant="soft"
-              items={EVENT_DAYS.map((d) => ({
-                key: d.key,
-                label: d.key === 'pick' && eventMode === 'pick' ? formatDate(eventStart) : d.label,
-              }))}
-              value={eventMode}
-              onChange={chooseEventDay}
-            />
-            <View style={styles.tileRow}>
-              <TimeTile label="Початок" value={formatTime(eventStart)} onPress={() => pickEventTime('start')} />
-              <TimeTile label="Кінець" value={formatTime(eventEnd)} onPress={() => pickEventTime('end')} />
+            <Chips variant="soft" items={EVENT_DAYS} value={eventMode} onChange={chooseEventDay} />
+            <View style={styles.valueRow}>
+              <Text style={styles.valueLabel}>Коли</Text>
+              <ValuePill icon="calendar" text={shortDate(eventStart)} onPress={() => chooseEventDay('pick')} label="Змінити дату події" />
+              <ValuePill icon="clock" text={formatTime(eventStart)} onPress={() => pickEventTime('start')} label="Змінити початок" />
+              <Text style={styles.valueDash}>–</Text>
+              <ValuePill text={formatTime(eventEnd)} onPress={() => pickEventTime('end')} label="Змінити кінець" />
             </View>
-            <Text style={styles.hint}>Нагадати:</Text>
+            <View style={[styles.valueRow, { marginTop: 10 }]}>
+              <Text style={styles.valueLabel}>Нагадати</Text>
+            </View>
             <Chips variant="soft" items={EVENT_REMINDERS} value={eventReminder} onChange={setEventReminder} />
           </View>
         )}
@@ -1987,7 +2113,13 @@ const styles = StyleSheet.create({
   inputRow: { flexDirection: 'row', gap: 8 },
   input: { flex: 1, height: 50, borderWidth: 2, borderColor: C.line, borderRadius: 14, paddingHorizontal: 14, fontSize: 16, fontFamily: F.bold, color: C.ink, backgroundColor: C.creamField },
   addButton: { width: 50, height: 50, borderRadius: 14, backgroundColor: C.green, alignItems: 'center', justifyContent: 'center' },
-  linkSmall: { fontFamily: F.bold, fontSize: 13, color: C.green, marginTop: -2 },
+  linkSmall: { fontFamily: F.bold, fontSize: 14, color: C.green, paddingVertical: 6 },
+  linkRow: { flexDirection: 'row', gap: 20, marginTop: -4 },
+  valueRow: { flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', gap: 8, marginTop: 2 },
+  valueLabel: { fontFamily: F.bold, fontSize: 14, color: C.muted, marginRight: 2 },
+  valuePill: { flexDirection: 'row', alignItems: 'center', gap: 6, height: 38, paddingHorizontal: 12, borderRadius: 12, borderWidth: 1.5, borderColor: C.line, backgroundColor: C.white },
+  valuePillText: { fontFamily: F.extra, fontSize: 15, color: C.greenDark },
+  valueDash: { fontFamily: F.bold, fontSize: 15, color: C.muted },
 
   segmented: { flexDirection: 'row', gap: 6, padding: 4, backgroundColor: C.mintLight, borderRadius: 14 },
   segment: { flex: 1, height: 40, borderRadius: 11, alignItems: 'center', justifyContent: 'center' },
