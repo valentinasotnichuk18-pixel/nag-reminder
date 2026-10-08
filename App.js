@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { StatusBar } from 'expo-status-bar';
 import {
-  StyleSheet, Text, TextInput, Pressable, View, FlatList, Keyboard, Alert,
+  StyleSheet, Text, TextInput, Pressable, View, FlatList, SectionList, Keyboard, Alert,
   ScrollView, Switch, AppState, LayoutAnimation, Linking,
 } from 'react-native';
 import * as SQLite from 'expo-sqlite';
@@ -224,10 +224,47 @@ function deadlineInfo(iso) {
   const now = new Date();
   const time = formatTime(d);
 
-  if (d < now) return { text: 'прострочено', overdue: true };
+  if (d < now) return { text: `було ${formatDate(d)} о ${time}`, overdue: true };
   if (isSameDay(d, now)) return { text: `до ${time}`, overdue: false };
   if (isSameDay(d, addDays(now, 1))) return { text: `завтра до ${time}`, overdue: false };
   return { text: `${formatDate(d)} до ${time}`, overdue: false };
+}
+
+// ---------- Групування списку ----------
+
+const TASK_GROUPS = [
+  { key: 'overdue', title: 'Прострочено', color: '#B42318' },
+  { key: 'today', title: 'Сьогодні', color: '#1F7A4D' },
+  { key: 'tomorrow', title: 'Завтра', color: '#3A5BA9' },
+  { key: 'later', title: 'Пізніше', color: '#5E6B62' },
+  { key: 'none', title: 'Без дедлайну', color: '#F4B860' },
+];
+
+function groupKeyFor(task, now) {
+  if (!task.deadline) return 'none';
+  const d = new Date(task.deadline);
+  if (d < now) return 'overdue';
+  if (isSameDay(d, now)) return 'today';
+  if (isSameDay(d, addDays(now, 1))) return 'tomorrow';
+  return 'later';
+}
+
+function groupTasks(tasks, collapsed) {
+  const now = new Date();
+  const buckets = {};
+  TASK_GROUPS.forEach((g) => { buckets[g.key] = []; });
+  tasks.forEach((t) => buckets[groupKeyFor(t, now)].push(t));
+
+  // З дедлайном: найраніший вгорі. Без дедлайну: найстаріша справа вгорі.
+  const byDeadline = (a, b) => new Date(a.deadline) - new Date(b.deadline);
+  const byCreated = (a, b) => a.id - b.id;
+
+  return TASK_GROUPS
+    .filter((g) => buckets[g.key].length > 0)
+    .map((g) => {
+      const items = buckets[g.key].sort(g.key === 'none' ? byCreated : byDeadline);
+      return { ...g, count: items.length, collapsed: !!collapsed[g.key], data: collapsed[g.key] ? [] : items };
+    });
 }
 
 function openPicker({ value, mode, minimumDate, onPick }) {
@@ -1488,6 +1525,12 @@ export default function App() {
   const [lastDone, setLastDone] = useState(null);
   const [infoMsg, setInfoMsg] = useState(null);
   const [tasks, setTasks] = useState(loadTasks);
+  const [collapsed, setCollapsed] = useState({});
+
+  const toggleGroup = (key) => {
+    LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+    setCollapsed((c) => ({ ...c, [key]: !c[key] }));
+  };
   const [settings, setSettings] = useState(loadSettings);
 
   const showDone = (task) => {
@@ -2028,12 +2071,25 @@ export default function App() {
         )}
       </View>
 
-      <FlatList
+      <SectionList
         style={{ marginTop: 6 }}
         contentContainerStyle={{ paddingBottom: 110 }}
-        data={tasks}
+        sections={groupTasks(tasks, collapsed)}
         keyExtractor={(item) => String(item.id)}
+        stickySectionHeadersEnabled={false}
         ListHeaderComponent={header}
+        renderSectionHeader={({ section }) => (
+          <Pressable
+            style={styles.groupHeader}
+            onPress={() => toggleGroup(section.key)}
+            accessibilityLabel={`${section.title}, ${section.count}. ${section.collapsed ? 'Розгорнути' : 'Згорнути'}`}
+          >
+            <View style={[styles.groupDot, { backgroundColor: section.color }]} />
+            <Text style={[styles.groupTitle, section.key === 'overdue' && { color: C.red }]}>{section.title}</Text>
+            <Text style={styles.groupCount}>{section.count}</Text>
+            <Text style={styles.groupChevron}>{section.collapsed ? '▸' : '▾'}</Text>
+          </Pressable>
+        )}
         ListEmptyComponent={
           <View style={styles.emptyBox}>
             <Text style={styles.emptyTitle}>Тиша і спокій</Text>
@@ -2178,6 +2234,11 @@ const styles = StyleSheet.create({
   badgeCount: { fontFamily: F.bold, color: C.greenDark, backgroundColor: C.mintLight },
   doneButton: { width: 48, height: 48, borderRadius: 24, borderWidth: 3, borderColor: C.green, backgroundColor: C.white, alignItems: 'center', justifyContent: 'center' },
 
+  groupHeader: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 8, marginTop: 4 },
+  groupDot: { width: 10, height: 10, borderRadius: 5 },
+  groupTitle: { fontFamily: F.bold, fontSize: 14, color: C.text },
+  groupCount: { fontFamily: F.bold, fontSize: 13, color: C.muted, backgroundColor: C.white, borderRadius: 10, paddingHorizontal: 8, paddingVertical: 1, overflow: 'hidden' },
+  groupChevron: { marginLeft: 'auto', fontSize: 14, color: C.muted, paddingHorizontal: 6 },
   emptyBox: { backgroundColor: C.white, borderRadius: 20, padding: 20, alignItems: 'center' },
   emptyTitle: { fontFamily: F.black, fontSize: 18, color: C.ink, marginBottom: 4 },
 
